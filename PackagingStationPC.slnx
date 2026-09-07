@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="PackagingStationPC.App/PackagingStationPC.App.csproj" />
+  <Project Path="PackagingStationPC.Tests/PackagingStationPC.Tests.csproj" />
+</Solution>
