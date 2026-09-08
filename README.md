@@ -2,6 +2,8 @@
 
 Origin Kit Gen1 包装工位上位机。该工程与 `spaceTestPC` 完全独立，不引用或修改原项目。
 
+完整启动、采集、绑定和 SwiftMOM 协议说明见 [PackagingStationPC 设计文档](docs/PackagingStationPC-设计文档.md)。
+
 ## 功能
 
 - 采集眼镜和左右手环版本，不读取主机应用或主机系统版本。
@@ -48,7 +50,7 @@ Origin Kit Gen1 包装工位上位机。该工程与 `spaceTestPC` 完全独立�
 }
 ```
 
-`mode` 为 `swiftmom` 时，每次上传依次调用 `clientLogin`、`checkRoute` 和 `createRoute`。外包装 SN 作为 `pcbSeq`；只有 `checkRoute` 返回 `msgId=0` 才会写入过站数据。眼镜和左右手环版本会序列化为紧凑 JSON 字符串写入 `rmk1`，`remark` 保持为空。`mode` 为 `mock` 时只执行本地模拟，不访问 MES。
+`mode` 为 `swiftmom` 时，每次上传依次调用 `clientLogin`、`checkRoute` 和 `createRoute`。外包装 SN 作为 `pcbSeq`；只有 `checkRoute` 返回 `msgId=0` 才会写入过站数据。完整设备 SN 和版本会序列化为紧凑 JSON 字符串写入 `rmk2`，`remark` 和 `rmk1` 保持为空。`mode` 为 `mock` 时只执行本地模拟，不访问 MES。
 
 `prodNo` 和 `stationNo` 仅在应用目录的 `appsettings.json` 中配置，不在生产界面显示。日志记录扫码、版本值、本地绑定，以及 SwiftMOM 各阶段的 URL、脱敏请求 JSON、HTTP 状态和脱敏响应 JSON。开发运行时日志位于工程根目录的 `logs\packaging-station.log`；发布后位于 EXE 目录的 `logs\packaging-station.log`。密码和 token 不写日志。
 

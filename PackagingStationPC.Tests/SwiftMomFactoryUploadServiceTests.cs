@@ -46,7 +46,8 @@ public sealed class SwiftMomFactoryUploadServiceTests
         Assert.Empty(create.RootElement.GetProperty("testDetail").EnumerateArray());
 
         Assert.Equal(string.Empty, create.RootElement.GetProperty("remark").GetString());
-        var versionJson = create.RootElement.GetProperty("rmk1").GetString();
+        Assert.Equal(string.Empty, create.RootElement.GetProperty("rmk1").GetString());
+        var versionJson = create.RootElement.GetProperty("rmk2").GetString();
         Assert.NotNull(versionJson);
         using var versions = JsonDocument.Parse(versionJson);
         Assert.False(versions.RootElement.TryGetProperty("host_app", out _));

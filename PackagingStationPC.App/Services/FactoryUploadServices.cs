@@ -168,8 +168,8 @@ public sealed class SwiftMomFactoryUploadService : IFactoryUploadService, IDispo
         userNo = _configuration.UserNo,
         weight = 0d,
         packNo = string.Empty,
-        rmk1 = CreateVersionString(record),
-        rmk2 = string.Empty,
+        rmk1 = string.Empty,
+        rmk2 = CreateVersionString(record),
         rmk3 = string.Empty,
         rmk4 = string.Empty,
         testDetail = Array.Empty<object>()
