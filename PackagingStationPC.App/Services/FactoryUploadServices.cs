@@ -6,8 +6,11 @@ using PackagingStationPC.Models;
 
 namespace PackagingStationPC.Services;
 
+public sealed record FactoryUploadProgress(string Stage, string State, string Message);
+
 public interface IFactoryUploadService
 {
+    event Action<FactoryUploadProgress>? ProgressChanged;
     string Mode { get; }
     Task<IntegrationResult> TestConnectionAsync(CancellationToken cancellationToken = default);
     Task<IntegrationResult> UploadAsync(ProductionRecord record, CancellationToken cancellationToken = default);
@@ -15,6 +18,7 @@ public interface IFactoryUploadService
 
 public sealed class MockFactoryUploadService : IFactoryUploadService
 {
+    public event Action<FactoryUploadProgress>? ProgressChanged;
     public string Mode => "mock";
 
     public async Task<IntegrationResult> TestConnectionAsync(CancellationToken cancellationToken = default)
@@ -27,7 +31,12 @@ public sealed class MockFactoryUploadService : IFactoryUploadService
         ProductionRecord record,
         CancellationToken cancellationToken = default)
     {
-        await Task.Delay(400, cancellationToken);
+        foreach (var stage in new[] { "clientLogin", "checkRoute", "createRoute" })
+        {
+            ProgressChanged?.Invoke(new FactoryUploadProgress(stage, "Running", "执行中"));
+            await Task.Delay(150, cancellationToken);
+            ProgressChanged?.Invoke(new FactoryUploadProgress(stage, "Succeeded", "模拟成功"));
+        }
         return new IntegrationResult(true, $"模拟上传成功: {record.PackageSn}", "{\"accepted\":true}");
     }
 }
@@ -39,6 +48,7 @@ public sealed class SwiftMomFactoryUploadService : IFactoryUploadService, IDispo
     private readonly HttpClient _httpClient;
     private readonly bool _ownsHttpClient;
     private readonly AppLogger? _logger;
+    public event Action<FactoryUploadProgress>? ProgressChanged;
 
     public SwiftMomFactoryUploadService(
         FactorySystemConfiguration configuration,
@@ -60,6 +70,9 @@ public sealed class SwiftMomFactoryUploadService : IFactoryUploadService, IDispo
         var validationError = ValidateConfiguration();
         if (validationError is not null)
         {
+            Report("clientLogin", "Failed", validationError);
+            Report("checkRoute", "Skipped", "配置校验失败，未执行");
+            Report("createRoute", "Skipped", "配置校验失败，未执行");
             return new IntegrationResult(false, validationError);
         }
 
@@ -83,9 +96,13 @@ public sealed class SwiftMomFactoryUploadService : IFactoryUploadService, IDispo
         var validationError = ValidateConfiguration();
         if (validationError is not null)
         {
+            Report("clientLogin", "Failed", validationError);
+            Report("checkRoute", "Skipped", "配置校验失败，未执行");
+            Report("createRoute", "Skipped", "配置校验失败，未执行");
             return new IntegrationResult(false, validationError);
         }
 
+        var activeStage = "clientLogin";
         try
         {
             await LogAsync("INFO", $"SwiftMOM upload start pcbSeq={record.PackageSn}, prodNo={_configuration.ProdNo}, stationNo={_configuration.StationNo}");
@@ -94,13 +111,18 @@ public sealed class SwiftMomFactoryUploadService : IFactoryUploadService, IDispo
                 userNo = _configuration.UserNo,
                 password = "***"
             });
+            Report("clientLogin", "Running", "正在登录 MES");
             var login = await LoginAsync(cancellationToken);
             await LogStageAsync("clientLogin", login);
+            ReportResponse("clientLogin", login);
             if (!login.IsMesSuccess || string.IsNullOrWhiteSpace(login.Token))
             {
+                Report("checkRoute", "Skipped", "登录失败，未执行");
+                Report("createRoute", "Skipped", "登录失败，未执行");
                 return new IntegrationResult(false, DescribeFailure("SwiftMOM 登录", login));
             }
 
+            activeStage = "checkRoute";
             var checkPayload = new
             {
                 pcbSeq = record.PackageSn,
@@ -109,35 +131,59 @@ public sealed class SwiftMomFactoryUploadService : IFactoryUploadService, IDispo
                 retest = _configuration.Retest
             };
             await LogRequestAsync("checkRoute", _configuration.CheckRoutePath, checkPayload);
+            Report("checkRoute", "Running", "正在检查过站路由");
             var check = await PostAsync(
                 _configuration.CheckRoutePath,
                 checkPayload,
                 login.Token,
                 cancellationToken);
             await LogStageAsync("checkRoute", check);
+            ReportResponse("checkRoute", check);
             if (!check.IsMesSuccess)
             {
+                Report("createRoute", "Skipped", "过站检查失败，未执行");
                 return new IntegrationResult(false, DescribeFailure("过站检查", check), check.Body);
             }
 
+            activeStage = "createRoute";
             var createPayload = CreateRoutePayload(record);
             await LogRequestAsync("createRoute", _configuration.CreateRoutePath, createPayload);
+            Report("createRoute", "Running", "正在写入过站记录");
             var create = await PostAsync(
                 _configuration.CreateRoutePath,
                 createPayload,
                 login.Token,
                 cancellationToken);
             await LogStageAsync("createRoute", create);
+            ReportResponse("createRoute", create);
             return create.IsMesSuccess
                 ? new IntegrationResult(true, $"SwiftMOM 过站成功: {record.PackageSn}", create.Body)
                 : new IntegrationResult(false, DescribeFailure("过站写入", create), create.Body);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
+            Report(activeStage, "Failed", ex.Message);
+            if (activeStage == "clientLogin")
+            {
+                Report("checkRoute", "Skipped", "登录异常，未执行");
+                Report("createRoute", "Skipped", "登录异常，未执行");
+            }
+            else if (activeStage == "checkRoute")
+            {
+                Report("createRoute", "Skipped", "过站检查异常，未执行");
+            }
             await LogAsync("ERROR", $"SwiftMOM upload exception pcbSeq={record.PackageSn}: {ex}");
             return new IntegrationResult(false, $"SwiftMOM 上传失败: {ex.Message}");
         }
     }
+
+    private void ReportResponse(string stage, SwiftMomResponse response) => Report(
+        stage,
+        response.IsMesSuccess ? "Succeeded" : "Failed",
+        $"HTTP {response.StatusCode} / msgId={response.MsgId?.ToString() ?? "null"}: {response.MsgStr}".TrimEnd(' ', ':'));
+
+    private void Report(string stage, string state, string message) =>
+        ProgressChanged?.Invoke(new FactoryUploadProgress(stage, state, message));
 
     public void Dispose()
     {

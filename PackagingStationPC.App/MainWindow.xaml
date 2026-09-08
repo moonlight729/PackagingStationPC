@@ -115,6 +115,23 @@
                                             <StackPanel>
                                                 <TextBlock Text="上传状态" Foreground="{StaticResource MutedTextBrush}" />
                                                 <TextBlock Text="{Binding CurrentUploadStatus}" FontWeight="SemiBold" Margin="0,4,0,0" />
+                                                <Grid Margin="0,10,0,0">
+                                                    <Grid.ColumnDefinitions>
+                                                        <ColumnDefinition Width="105" />
+                                                        <ColumnDefinition Width="*" />
+                                                    </Grid.ColumnDefinitions>
+                                                    <Grid.RowDefinitions>
+                                                        <RowDefinition Height="Auto" />
+                                                        <RowDefinition Height="Auto" />
+                                                        <RowDefinition Height="Auto" />
+                                                    </Grid.RowDefinitions>
+                                                    <TextBlock Text="1. MES 登录" Foreground="{StaticResource MutedTextBrush}" />
+                                                    <TextBlock Grid.Column="1" Text="{Binding LoginStageStatus}" TextWrapping="Wrap" />
+                                                    <TextBlock Grid.Row="1" Text="2. 过站检查" Foreground="{StaticResource MutedTextBrush}" Margin="0,7,0,0" />
+                                                    <TextBlock Grid.Row="1" Grid.Column="1" Text="{Binding CheckRouteStageStatus}" TextWrapping="Wrap" Margin="0,7,0,0" />
+                                                    <TextBlock Grid.Row="2" Text="3. 过站写入" Foreground="{StaticResource MutedTextBrush}" Margin="0,7,0,0" />
+                                                    <TextBlock Grid.Row="2" Grid.Column="1" Text="{Binding CreateRouteStageStatus}" TextWrapping="Wrap" Margin="0,7,0,0" />
+                                                </Grid>
                                             </StackPanel>
                                         </Border>
                                     </Grid>

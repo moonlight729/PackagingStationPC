@@ -26,6 +26,9 @@ public sealed class MainViewModel : ObservableObject
     private bool _moduleHasError;
     private string _scannerInput = string.Empty;
     private string _scannedPackageCode = string.Empty;
+    private string _loginStageStatus = "等待上传";
+    private string _checkRouteStageStatus = "等待上传";
+    private string _createRouteStageStatus = "等待上传";
 
     public MainViewModel(
         AppConfiguration configuration,
@@ -70,6 +73,7 @@ public sealed class MainViewModel : ObservableObject
         RefreshRecordsCommand = new AsyncRelayCommand(() => RunBusyAsync(RefreshRecordsAsync), () => !IsBusy);
 
         _versionService.ProgressChanged += message => StatusMessage = message;
+        _uploadService.ProgressChanged += OnUploadProgressChanged;
     }
 
     public string ProductCode => _configuration.Sn.ProductCode;
@@ -235,6 +239,23 @@ public sealed class MainViewModel : ObservableObject
 
     public string CurrentUploadStatus => CurrentRecord?.UploadStatus.ToString() ?? "未预留";
     public string CurrentDeviceSerial => CurrentRecord?.DeviceSerial ?? _snapshot?.DeviceSerial ?? "-";
+    public string LoginStageStatus
+    {
+        get => _loginStageStatus;
+        private set => SetProperty(ref _loginStageStatus, value);
+    }
+
+    public string CheckRouteStageStatus
+    {
+        get => _checkRouteStageStatus;
+        private set => SetProperty(ref _checkRouteStageStatus, value);
+    }
+
+    public string CreateRouteStageStatus
+    {
+        get => _createRouteStageStatus;
+        private set => SetProperty(ref _createRouteStageStatus, value);
+    }
 
     public AsyncRelayCommand RefreshDevicesCommand { get; }
     public AsyncRelayCommand QueryVersionsCommand { get; }
@@ -307,6 +328,36 @@ public sealed class MainViewModel : ObservableObject
         VersionRows.Clear();
         ModuleMessage = string.Empty;
         ModuleHasError = false;
+        LoginStageStatus = "等待上传";
+        CheckRouteStageStatus = "等待上传";
+        CreateRouteStageStatus = "等待上传";
+    }
+
+    private void OnUploadProgressChanged(FactoryUploadProgress progress)
+    {
+        var state = progress.State switch
+        {
+            "Running" => "执行中",
+            "Succeeded" => "成功",
+            "Failed" => "失败",
+            "Skipped" => "未执行",
+            _ => progress.State
+        };
+        var display = string.IsNullOrWhiteSpace(progress.Message)
+            ? state
+            : $"{state} | {progress.Message}";
+        switch (progress.Stage)
+        {
+            case "clientLogin":
+                LoginStageStatus = display;
+                break;
+            case "checkRoute":
+                CheckRouteStageStatus = display;
+                break;
+            case "createRoute":
+                CreateRouteStageStatus = display;
+                break;
+        }
     }
 
     private static string? ValidateForUpload(DeviceVersionSnapshot snapshot)
