@@ -110,13 +110,6 @@
                                         </StackPanel>
                                     </Border>
 
-                                    <TextBlock Text="SwiftMOM 配置" FontSize="15" FontWeight="SemiBold" Margin="0,18,0,8" />
-                                    <TextBlock Text="工单号 prodNo" Foreground="{StaticResource MutedTextBrush}" />
-                                    <TextBox Text="{Binding ConfiguredProdNo, UpdateSourceTrigger=PropertyChanged}" Margin="0,4,0,8" />
-                                    <TextBlock Text="站位编号 stationNo" Foreground="{StaticResource MutedTextBrush}" />
-                                    <TextBox Text="{Binding ConfiguredStationNo, UpdateSourceTrigger=PropertyChanged}" Margin="0,4,0,0" />
-                                    <Button Content="保存工单与站位配置" Command="{Binding SaveFactoryConfigurationCommand}" Margin="0,10,0,0" />
-
                                     <Grid Margin="0,18,0,0">
                                         <Border Background="#F5F6F7" Padding="10">
                                             <StackPanel>
@@ -125,8 +118,6 @@
                                             </StackPanel>
                                         </Border>
                                     </Grid>
-
-                                    <Button Content="上传当前记录" Command="{Binding UploadCommand}" Margin="0,10,0,0" />
                                 </StackPanel>
                             </ScrollViewer>
                         </Border>
@@ -138,42 +129,8 @@
                                 <ColumnDefinition Width="*" />
                                 <ColumnDefinition Width="Auto" />
                             </Grid.ColumnDefinitions>
-                            <TextBlock Text="{Binding ModuleMessage}" VerticalAlignment="Center" TextWrapping="Wrap" Foreground="#6C4A13" />
-                            <Button Grid.Column="1" Content="下一台设备" Command="{Binding NextDeviceCommand}" Style="{StaticResource PrimaryButton}" Margin="16,0,0,0" />
+                            <TextBlock Text="{Binding ModuleMessage}" VerticalAlignment="Center" TextWrapping="Wrap" Foreground="{Binding ModuleMessageBrush}" FontWeight="SemiBold" />
                         </Grid>
-                    </Border>
-                </Grid>
-            </TabItem>
-
-            <TabItem Header="上传调试">
-                <Grid Margin="22">
-                    <Grid.RowDefinitions>
-                        <RowDefinition Height="Auto" />
-                        <RowDefinition Height="Auto" />
-                        <RowDefinition Height="Auto" />
-                        <RowDefinition Height="*" />
-                    </Grid.RowDefinitions>
-                    <TextBlock Text="工厂系统接口" FontSize="20" FontWeight="SemiBold" />
-                    <Grid Grid.Row="1" Margin="0,18,0,0" MaxWidth="900" HorizontalAlignment="Left">
-                        <Grid.RowDefinitions>
-                            <RowDefinition Height="Auto" />
-                            <RowDefinition Height="Auto" />
-                        </Grid.RowDefinitions>
-                        <Grid.ColumnDefinitions>
-                            <ColumnDefinition Width="140" />
-                            <ColumnDefinition Width="*" />
-                        </Grid.ColumnDefinitions>
-                        <TextBlock Text="当前模式" Foreground="{StaticResource MutedTextBrush}" />
-                        <TextBlock Grid.Column="1" Text="{Binding UploadMode}" FontWeight="SemiBold" />
-                        <TextBlock Grid.Row="1" Text="上传地址" Foreground="{StaticResource MutedTextBrush}" Margin="0,14,0,0" />
-                        <TextBlock Grid.Row="1" Grid.Column="1" Text="{Binding UploadEndpoint}" FontFamily="Consolas" Margin="0,14,0,0" TextWrapping="Wrap" />
-                    </Grid>
-                    <StackPanel Grid.Row="2" Orientation="Horizontal" Margin="0,22,0,0">
-                        <Button Content="测试接口连接" Command="{Binding TestUploadCommand}" />
-                        <Button Content="上传当前记录" Command="{Binding UploadCommand}" Style="{StaticResource PrimaryButton}" />
-                    </StackPanel>
-                    <Border Grid.Row="3" Background="White" BorderBrush="{StaticResource LineBrush}" BorderThickness="1" CornerRadius="6" Padding="18" Margin="0,22,0,0">
-                        <TextBlock Text="{Binding ModuleMessage}" TextWrapping="Wrap" />
                     </Border>
                 </Grid>
             </TabItem>

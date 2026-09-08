@@ -23,10 +23,9 @@ public sealed class MainViewModel : ObservableObject
     private bool _isBusy;
     private string _statusMessage = "正在初始化...";
     private string _moduleMessage = string.Empty;
+    private bool _moduleHasError;
     private string _scannerInput = string.Empty;
     private string _scannedPackageCode = string.Empty;
-    private string _configuredProdNo;
-    private string _configuredStationNo;
 
     public MainViewModel(
         AppConfiguration configuration,
@@ -44,8 +43,6 @@ public sealed class MainViewModel : ObservableObject
         _uploadService = uploadService;
         _scannerService = scannerService;
         _logger = logger;
-        _configuredProdNo = configuration.FactorySystem.ProdNo;
-        _configuredStationNo = configuration.FactorySystem.StationNo;
 
         var current = SnGenerator.CurrentIsoYearWeek(DateTime.Today);
         _selectedYear = current.Year;
@@ -66,12 +63,9 @@ public sealed class MainViewModel : ObservableObject
         RefreshSequenceCommand = new AsyncRelayCommand(() => RunBusyAsync(LoadNextSequenceAsync), () => !IsBusy && CurrentRecord is null);
         SetSequenceCommand = new AsyncRelayCommand(() => RunBusyAsync(SetSequenceAsync), () => !IsBusy && CurrentRecord is null);
         ReserveSnCommand = new AsyncRelayCommand(() => RunBusyAsync(ReserveSnAsync), CanReserveSn);
-        TestUploadCommand = new AsyncRelayCommand(() => RunBusyAsync(TestUploadAsync), () => !IsBusy);
         UploadCommand = new AsyncRelayCommand(() => RunBusyAsync(UploadAsync), () => !IsBusy && CurrentRecord is not null);
         ScanCommand = new AsyncRelayCommand(() => RunBusyAsync(ProcessScanAsync),
-            () => !IsBusy && CurrentRecord is null && !string.IsNullOrWhiteSpace(ScannerInput));
-        SaveFactoryConfigurationCommand = new AsyncRelayCommand(
-            () => RunBusyAsync(SaveFactoryConfigurationAsync), () => !IsBusy);
+            () => !IsBusy && !string.IsNullOrWhiteSpace(ScannerInput));
         NextDeviceCommand = new AsyncRelayCommand(() => RunBusyAsync(NextDeviceAsync), CanMoveNext);
         RefreshRecordsCommand = new AsyncRelayCommand(() => RunBusyAsync(RefreshRecordsAsync), () => !IsBusy);
 
@@ -104,17 +98,6 @@ public sealed class MainViewModel : ObservableObject
         private set => SetProperty(ref _scannedPackageCode, value);
     }
 
-    public string ConfiguredProdNo
-    {
-        get => _configuredProdNo;
-        set => SetProperty(ref _configuredProdNo, value);
-    }
-
-    public string ConfiguredStationNo
-    {
-        get => _configuredStationNo;
-        set => SetProperty(ref _configuredStationNo, value);
-    }
     public IReadOnlyList<string> FactoryCodes { get; }
     public IReadOnlyList<int> Years { get; }
     public IReadOnlyList<int> Weeks { get; }
@@ -201,6 +184,20 @@ public sealed class MainViewModel : ObservableObject
         private set => SetProperty(ref _moduleMessage, value);
     }
 
+    public string ModuleMessageBrush => ModuleHasError ? "#B42318" : "#172023";
+
+    private bool ModuleHasError
+    {
+        get => _moduleHasError;
+        set
+        {
+            if (SetProperty(ref _moduleHasError, value))
+            {
+                OnPropertyChanged(nameof(ModuleMessageBrush));
+            }
+        }
+    }
+
     public string SnPreview
     {
         get
@@ -244,10 +241,8 @@ public sealed class MainViewModel : ObservableObject
     public AsyncRelayCommand RefreshSequenceCommand { get; }
     public AsyncRelayCommand SetSequenceCommand { get; }
     public AsyncRelayCommand ReserveSnCommand { get; }
-    public AsyncRelayCommand TestUploadCommand { get; }
     public AsyncRelayCommand UploadCommand { get; }
     public AsyncRelayCommand ScanCommand { get; }
-    public AsyncRelayCommand SaveFactoryConfigurationCommand { get; }
     public AsyncRelayCommand NextDeviceCommand { get; }
     public AsyncRelayCommand RefreshRecordsCommand { get; }
 
@@ -273,7 +268,9 @@ public sealed class MainViewModel : ObservableObject
             throw new InvalidOperationException("外包装盒码为空、过长或包含控制字符，请重新扫描。");
         }
 
+        ResetCurrentUnit();
         ScannedPackageCode = packageCode;
+        ModuleHasError = false;
         await _logger.WriteAsync("INFO", $"Scan received package={packageCode}, selectedDevice={SelectedDevice?.Serial ?? "auto"}");
         ModuleMessage = $"已扫描 {packageCode}，正在读取设备 SN 和版本。";
         await QueryVersionsAsync();
@@ -282,9 +279,10 @@ public sealed class MainViewModel : ObservableObject
             throw new InvalidOperationException("设备信息读取没有返回结果。");
         }
 
-        if (_configuration.Adb.RequireCompleteVersionSet && !_snapshot.IsComplete)
+        var validationError = ValidateForUpload(_snapshot);
+        if (validationError is not null)
         {
-            throw new InvalidOperationException("必需版本项不完整，绑定和上传已停止。");
+            throw new InvalidOperationException($"设备信息不完整，禁止上传 MES：{validationError}");
         }
 
         var reservation = await _repository.BindScannedPackageAsync(
@@ -301,21 +299,38 @@ public sealed class MainViewModel : ObservableObject
         await UploadAsync();
     }
 
-    private async Task SaveFactoryConfigurationAsync()
+    private void ResetCurrentUnit()
     {
-        if (string.IsNullOrWhiteSpace(ConfiguredProdNo) || string.IsNullOrWhiteSpace(ConfiguredStationNo))
-        {
-            throw new InvalidOperationException("工单号和站位编号不能为空。");
-        }
+        CurrentRecord = null;
+        _snapshot = null;
+        ScannedPackageCode = string.Empty;
+        VersionRows.Clear();
+        ModuleMessage = string.Empty;
+        ModuleHasError = false;
+    }
 
-        _configuration.FactorySystem.ProdNo = ConfiguredProdNo.Trim();
-        _configuration.FactorySystem.StationNo = ConfiguredStationNo.Trim();
-        ConfigurationService.Save(_configuration);
-        OnPropertyChanged(nameof(UploadEndpoint));
-        ModuleMessage = $"配置已保存：工单 {_configuration.FactorySystem.ProdNo}，站位 {_configuration.FactorySystem.StationNo}。";
-        await _logger.WriteAsync(
-            "INFO",
-            $"Factory configuration saved prodNo={_configuration.FactorySystem.ProdNo}, stationNo={_configuration.FactorySystem.StationNo}");
+    private static string? ValidateForUpload(DeviceVersionSnapshot snapshot)
+    {
+        var missing = new List<string>();
+        var box = snapshot.Components.FirstOrDefault(item => item.Component == "box");
+        Require(box, "盒子", "sn", "uboot", "kernel", "rootfs");
+        var glasses = snapshot.Components.FirstOrDefault(item => item.Component == "glasses");
+        Require(glasses, "眼镜", "sn", "uboot", "kernel", "rootfs", "app");
+        var band = snapshot.Components.FirstOrDefault(item => item.Component == "band");
+        Require(band, "手环", "leftSn", "rightSn");
+        return missing.Count == 0 ? null : string.Join("、", missing);
+
+        void Require(VersionComponentResult? component, string displayName, params string[] fields)
+        {
+            foreach (var field in fields)
+            {
+                if (component is null || !component.Values.TryGetValue(field, out var value) ||
+                    string.IsNullOrWhiteSpace(value))
+                {
+                    missing.Add($"{displayName}.{DisplayField(field)}");
+                }
+            }
+        }
     }
 
     private async Task RefreshDevicesAsync()
@@ -363,9 +378,11 @@ public sealed class MainViewModel : ObservableObject
         }
 
         OnPropertyChanged(nameof(CurrentDeviceSerial));
-        ModuleMessage = _snapshot.IsComplete
-            ? "必需版本项已完整读取，可以预留 SN。"
-            : "存在失败或使用历史值的必需版本项，请排查后重新读取。";
+        var validationError = ValidateForUpload(_snapshot);
+        ModuleHasError = validationError is not null;
+        ModuleMessage = validationError is null
+            ? "产品 SN 和必需版本已完整读取。"
+            : $"设备信息读取不完整：{validationError}";
         foreach (var component in _snapshot.Components)
         {
             var values = component.Values.Count == 0
@@ -438,13 +455,6 @@ public sealed class MainViewModel : ObservableObject
         await _logger.WriteAsync("INFO", $"SN reserved sn={reservation.Record.PackageSn}, device={reservation.Record.DeviceSerial}, existing={reservation.WasExisting}");
     }
 
-    private async Task TestUploadAsync()
-    {
-        var result = await _uploadService.TestConnectionAsync();
-        ModuleMessage = result.Message;
-        await _logger.WriteAsync(result.Success ? "INFO" : "ERROR", $"Upload connection test: {result.Message}");
-    }
-
     private async Task UploadAsync()
     {
         var record = CurrentRecord ?? throw new InvalidOperationException("请先预留 SN。");
@@ -452,6 +462,7 @@ public sealed class MainViewModel : ObservableObject
         await _repository.UpdateUploadAsync(record.Id, result);
         CurrentRecord = await _repository.GetByIdAsync(record.Id);
         ModuleMessage = result.Message;
+        ModuleHasError = !result.Success;
         await RefreshRecordsAsync();
         await _logger.WriteAsync(result.Success ? "INFO" : "ERROR", $"Upload sn={record.PackageSn}: {result.Message}");
     }
@@ -532,6 +543,7 @@ public sealed class MainViewModel : ObservableObject
         {
             StatusMessage = "操作失败。";
             ModuleMessage = ex.Message;
+            ModuleHasError = true;
             await _logger.WriteAsync("ERROR", ex.ToString());
         }
         finally
@@ -547,10 +559,8 @@ public sealed class MainViewModel : ObservableObject
         RefreshSequenceCommand.RaiseCanExecuteChanged();
         SetSequenceCommand.RaiseCanExecuteChanged();
         ReserveSnCommand.RaiseCanExecuteChanged();
-        TestUploadCommand.RaiseCanExecuteChanged();
         UploadCommand.RaiseCanExecuteChanged();
         ScanCommand.RaiseCanExecuteChanged();
-        SaveFactoryConfigurationCommand.RaiseCanExecuteChanged();
         NextDeviceCommand.RaiseCanExecuteChanged();
         RefreshRecordsCommand.RaiseCanExecuteChanged();
     }

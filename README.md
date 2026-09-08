@@ -15,7 +15,7 @@ Origin Kit Gen1 包装工位上位机。该工程与 `spaceTestPC` 完全独立�
 
 ## 扫码流程
 
-扫码枪按标准 USB 键盘模式接入。程序收到 Enter、换行或输入停止 500ms 后提交盒码，随后自动读取设备 SN 和版本、保存本地绑定、调用 SwiftMOM 三步接口。上传失败时保留当前记录以便重试；上传成功后点击“下一台设备”继续扫码。已成功上传的盒码与设备绑定禁止修改，未成功上传的旧绑定可由下一次扫码纠正。
+扫码枪按标准 USB 键盘模式接入。程序收到 Enter、换行或输入停止 500ms 后提交盒码，随后自动读取设备 SN 和版本、保存本地绑定、调用 SwiftMOM 三步接口。下一次扫码会自动清空上一台的界面结果并开始新流程，SQLite 历史记录不会删除。盒子或眼镜的必需 SN/版本、左右手环 SN 任一缺失时，界面以红字提示并停止绑定和 MES 上报；当前手环固件不支持版本命令时允许版本为空。已成功上传的盒码与设备绑定禁止修改。
 
 ## 版本采集
 
@@ -50,7 +50,7 @@ Origin Kit Gen1 包装工位上位机。该工程与 `spaceTestPC` 完全独立�
 
 `mode` 为 `swiftmom` 时，每次上传依次调用 `clientLogin`、`checkRoute` 和 `createRoute`。外包装 SN 作为 `pcbSeq`；只有 `checkRoute` 返回 `msgId=0` 才会写入过站数据。眼镜和左右手环版本会序列化为紧凑 JSON 字符串写入 `rmk1`，`remark` 保持为空。`mode` 为 `mock` 时只执行本地模拟，不访问 MES。
 
-生产页可以修改并保存 `prodNo` 和 `stationNo`，保存后立即用于后续上传并写回应用目录的 `appsettings.json`。日志记录扫码、版本值、本地绑定及 SwiftMOM 各阶段结果，默认位于 `%LOCALAPPDATA%\OriginFlow\PackagingStationPC\packaging-station.log`；密码和 token 不写日志。
+`prodNo` 和 `stationNo` 仅在应用目录的 `appsettings.json` 中配置，不在生产界面显示。日志记录扫码、版本值、本地绑定，以及 SwiftMOM 各阶段的 URL、脱敏请求 JSON、HTTP 状态和脱敏响应 JSON。开发运行时日志位于工程根目录的 `logs\packaging-station.log`；发布后位于 EXE 目录的 `logs\packaging-station.log`。密码和 token 不写日志。
 
 打印配置当前固定为停用模式：
 
@@ -81,11 +81,13 @@ Origin Kit Gen1 包装工位上位机。该工程与 `spaceTestPC` 完全独立�
 
 ## 数据
 
-数据库和日志默认位于：
+数据库默认位于：
 
 ```text
 %LOCALAPPDATA%\OriginFlow\PackagingStationPC\
 ```
+
+日志位于工程或发布目录的 `logs\packaging-station.log`。
 
 `production_records` 分别保存 `upload_status` 和 `print_status`。流水号在预留 SN 时立即占用；失败重试使用原 SN，不会重新取号。操作员手动设置下一流水号会写入 `counter_events`。
 

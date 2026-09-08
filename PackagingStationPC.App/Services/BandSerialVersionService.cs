@@ -21,7 +21,7 @@ public sealed partial class BandSerialVersionService : IBandSerialVersionService
     private static readonly TimeSpan HandTimeout = TimeSpan.FromMilliseconds(1500);
     private static readonly TimeSpan SnTimeout = TimeSpan.FromSeconds(2);
     private static readonly TimeSpan VersionTimeout = TimeSpan.FromSeconds(2);
-    private static readonly byte[] ConsoleResync = "\u001b[1;1R\r\n\r\n"u8.ToArray();
+    private static readonly byte[] ConsoleResync = "\r\n"u8.ToArray();
 
     public async Task<VersionComponentResult> QueryAsync(CancellationToken cancellationToken = default)
     {
@@ -119,8 +119,8 @@ public sealed partial class BandSerialVersionService : IBandSerialVersionService
         using var port = new SerialPort(portName, BaudRate, Parity.None, 8, StopBits.One)
         {
             Handshake = Handshake.None,
-            DtrEnable = true,
-            RtsEnable = true,
+            DtrEnable = false,
+            RtsEnable = false,
             ReadTimeout = 100,
             WriteTimeout = 1000,
             Encoding = Encoding.UTF8,
@@ -130,8 +130,7 @@ public sealed partial class BandSerialVersionService : IBandSerialVersionService
         try
         {
             await Task.Run(port.Open, cancellationToken);
-            // Opening the ESP32-S3 USB serial port toggles DTR/RTS and can reset it.
-            await Task.Delay(500, cancellationToken);
+            await Task.Delay(300, cancellationToken);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {

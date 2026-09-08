@@ -22,7 +22,7 @@ public partial class App : Application
             var bandSerialVersionService = new BandSerialVersionService();
             var glassesAcmService = new GlassesAcmService(adbClient);
             var versionService = new DeviceVersionService(adbClient, bandSerialVersionService, glassesAcmService);
-            var logger = new AppLogger(Path.Combine(dataDirectory, "packaging-station.log"));
+            var logger = new AppLogger(Path.Combine(ConfigurationService.GetLogDirectory(), "packaging-station.log"));
             var uploadService = FactoryUploadServiceFactory.Create(configuration.FactorySystem, logger);
             var scannerService = new ScannerService();
             var viewModel = new MainViewModel(

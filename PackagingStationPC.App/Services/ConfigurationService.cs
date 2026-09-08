@@ -44,4 +44,24 @@ public static class ConfigurationService
         Directory.CreateDirectory(directory);
         return directory;
     }
+
+    public static string GetLogDirectory()
+    {
+        var directory = new DirectoryInfo(AppContext.BaseDirectory);
+        while (directory is not null)
+        {
+            if (File.Exists(Path.Combine(directory.FullName, "PackagingStationPC.slnx")))
+            {
+                var projectLogs = Path.Combine(directory.FullName, "logs");
+                Directory.CreateDirectory(projectLogs);
+                return projectLogs;
+            }
+
+            directory = directory.Parent;
+        }
+
+        var applicationLogs = Path.Combine(AppContext.BaseDirectory, "logs");
+        Directory.CreateDirectory(applicationLogs);
+        return applicationLogs;
+    }
 }

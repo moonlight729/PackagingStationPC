@@ -1,6 +1,7 @@
 using System.Net.Http;
 using System.Net.Http.Json;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using PackagingStationPC.Models;
 
 namespace PackagingStationPC.Services;
@@ -88,6 +89,11 @@ public sealed class SwiftMomFactoryUploadService : IFactoryUploadService, IDispo
         try
         {
             await LogAsync("INFO", $"SwiftMOM upload start pcbSeq={record.PackageSn}, prodNo={_configuration.ProdNo}, stationNo={_configuration.StationNo}");
+            await LogRequestAsync("clientLogin", _configuration.ClientLoginPath, new
+            {
+                userNo = _configuration.UserNo,
+                password = "***"
+            });
             var login = await LoginAsync(cancellationToken);
             await LogStageAsync("clientLogin", login);
             if (!login.IsMesSuccess || string.IsNullOrWhiteSpace(login.Token))
@@ -95,15 +101,17 @@ public sealed class SwiftMomFactoryUploadService : IFactoryUploadService, IDispo
                 return new IntegrationResult(false, DescribeFailure("SwiftMOM 登录", login));
             }
 
+            var checkPayload = new
+            {
+                pcbSeq = record.PackageSn,
+                prodNo = _configuration.ProdNo,
+                stationNo = _configuration.StationNo,
+                retest = _configuration.Retest
+            };
+            await LogRequestAsync("checkRoute", _configuration.CheckRoutePath, checkPayload);
             var check = await PostAsync(
                 _configuration.CheckRoutePath,
-                new
-                {
-                    pcbSeq = record.PackageSn,
-                    prodNo = _configuration.ProdNo,
-                    stationNo = _configuration.StationNo,
-                    retest = _configuration.Retest
-                },
+                checkPayload,
                 login.Token,
                 cancellationToken);
             await LogStageAsync("checkRoute", check);
@@ -112,9 +120,11 @@ public sealed class SwiftMomFactoryUploadService : IFactoryUploadService, IDispo
                 return new IntegrationResult(false, DescribeFailure("过站检查", check), check.Body);
             }
 
+            var createPayload = CreateRoutePayload(record);
+            await LogRequestAsync("createRoute", _configuration.CreateRoutePath, createPayload);
             var create = await PostAsync(
                 _configuration.CreateRoutePath,
-                CreateRoutePayload(record),
+                createPayload,
                 login.Token,
                 cancellationToken);
             await LogStageAsync("createRoute", create);
@@ -267,9 +277,32 @@ public sealed class SwiftMomFactoryUploadService : IFactoryUploadService, IDispo
         return $"{operation}失败: msgId={response.MsgId}, {response.MsgStr}".TrimEnd(' ', ',');
     }
 
+    private Task LogRequestAsync(string stage, string path, object payload) => LogAsync(
+        "INFO",
+        $"SwiftMOM request stage={stage}, url={new Uri(_httpClient.BaseAddress!, path.TrimStart('/'))}, body={JsonSerializer.Serialize(payload, JsonOptions)}");
+
     private Task LogStageAsync(string stage, SwiftMomResponse response) => LogAsync(
         response.IsMesSuccess ? "INFO" : "ERROR",
-        $"SwiftMOM stage={stage}, http={response.StatusCode}, msgId={response.MsgId?.ToString() ?? "null"}, msgStr={response.MsgStr}");
+        $"SwiftMOM response stage={stage}, http={response.StatusCode}, msgId={response.MsgId?.ToString() ?? "null"}, msgStr={response.MsgStr}, body={RedactResponse(response.Body, response.Token)}");
+
+    private static string RedactResponse(string body, string token)
+    {
+        try
+        {
+            var node = JsonNode.Parse(body);
+            if (node is JsonObject value && value.ContainsKey("token"))
+            {
+                value["token"] = "***";
+            }
+
+            var sanitized = node?.ToJsonString(JsonOptions) ?? body;
+            return string.IsNullOrWhiteSpace(token) ? sanitized : sanitized.Replace(token, "***", StringComparison.Ordinal);
+        }
+        catch (JsonException)
+        {
+            return string.IsNullOrWhiteSpace(token) ? body : body.Replace(token, "***", StringComparison.Ordinal);
+        }
+    }
 
     private Task LogAsync(string level, string message) =>
         _logger?.WriteAsync(level, message) ?? Task.CompletedTask;
