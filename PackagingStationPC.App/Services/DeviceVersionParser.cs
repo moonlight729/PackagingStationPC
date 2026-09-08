@@ -26,6 +26,12 @@ public static partial class DeviceVersionParser
         return match.Success ? match.Groups["value"].Value.Trim() : null;
     }
 
+    public static string? ParseBandSerial(string output)
+    {
+        var match = BandSerialRegex().Match(StripAnsi(output));
+        return match.Success ? match.Groups["value"].Value.Trim().ToUpperInvariant() : null;
+    }
+
     private static string StripAnsi(string value) => AnsiEscapeRegex().Replace(value, string.Empty);
 
     [GeneratedRegex("\\bhand\\s*=\\s*(?<hand>left|right|l|r)\\b", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
@@ -33,6 +39,9 @@ public static partial class DeviceVersionParser
 
     [GeneratedRegex("\\bversion\\s*=\\s*(?<value>[^\\r\\n]+)", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
     private static partial Regex BandVersionRegex();
+
+    [GeneratedRegex("\\bsn\\s*=\\s*(?<value>[A-Za-z0-9.\\-]+)", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
+    private static partial Regex BandSerialRegex();
 
     [GeneratedRegex("\\x1B\\[[0-?]*[ -/]*[@-~]", RegexOptions.CultureInvariant)]
     private static partial Regex AnsiEscapeRegex();

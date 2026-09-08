@@ -20,17 +20,18 @@ public partial class App : Application
             var processRunner = new ProcessRunner();
             var adbClient = new AdbClient(configuration.Adb, processRunner);
             var bandSerialVersionService = new BandSerialVersionService();
-            var versionService = new DeviceVersionService(adbClient, bandSerialVersionService);
-            var uploadService = FactoryUploadServiceFactory.Create(configuration.FactorySystem);
-            var printerService = LabelPrinterServiceFactory.Create(configuration.Printer);
+            var glassesAcmService = new GlassesAcmService(adbClient);
+            var versionService = new DeviceVersionService(adbClient, bandSerialVersionService, glassesAcmService);
             var logger = new AppLogger(Path.Combine(dataDirectory, "packaging-station.log"));
+            var uploadService = FactoryUploadServiceFactory.Create(configuration.FactorySystem, logger);
+            var scannerService = new ScannerService();
             var viewModel = new MainViewModel(
                 configuration,
                 versionService,
                 snGenerator,
                 repository,
                 uploadService,
-                printerService,
+                scannerService,
                 logger);
             var window = new MainWindow(viewModel);
             MainWindow = window;

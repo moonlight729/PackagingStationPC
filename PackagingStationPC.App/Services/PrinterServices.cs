@@ -1,5 +1,6 @@
 using System.Printing;
 using System.Reflection;
+using System.Runtime.InteropServices;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Media;
@@ -138,7 +139,19 @@ public sealed class BarTenderSdkAdapter : IBarTenderSdkAdapter
 {
     public IntegrationResult Test(PrinterConfiguration configuration)
     {
-        var assembly = LoadSdkAssembly(configuration.BarTenderSdkAssemblyPath);
+        try
+        {
+            var assembly = LoadSdkAssembly(configuration.BarTenderSdkAssemblyPath);
+            return TestWithSdk(assembly, configuration);
+        }
+        catch (BadImageFormatException)
+        {
+            return TestWithAutomation(configuration);
+        }
+    }
+
+    private static IntegrationResult TestWithSdk(Assembly assembly, PrinterConfiguration configuration)
+    {
         return WithFormat(
             assembly,
             configuration,
@@ -154,13 +167,28 @@ public sealed class BarTenderSdkAdapter : IBarTenderSdkAdapter
                 _ = Convert.ToString(namedDataSource.Value);
                 return new IntegrationResult(
                     true,
-                    $"BarTender 2022 模板可用: {IOPath.GetFileName(configuration.TemplatePath)}");
+                    $"BarTender SDK 模板可用: {IOPath.GetFileName(configuration.TemplatePath)}");
             });
     }
 
     public IntegrationResult Print(PrinterConfiguration configuration, string packageSn)
     {
-        var assembly = LoadSdkAssembly(configuration.BarTenderSdkAssemblyPath);
+        try
+        {
+            var assembly = LoadSdkAssembly(configuration.BarTenderSdkAssemblyPath);
+            return PrintWithSdk(assembly, configuration, packageSn);
+        }
+        catch (BadImageFormatException)
+        {
+            return PrintWithAutomation(configuration, packageSn);
+        }
+    }
+
+    private static IntegrationResult PrintWithSdk(
+        Assembly assembly,
+        PrinterConfiguration configuration,
+        string packageSn)
+    {
         return WithFormat(
             assembly,
             configuration,
@@ -190,6 +218,89 @@ public sealed class BarTenderSdkAdapter : IBarTenderSdkAdapter
                     ? new IntegrationResult(true, $"BarTender 标签打印成功: {packageSn}")
                     : new IntegrationResult(false, $"BarTender 打印失败: {resultName}");
             });
+    }
+
+    private static IntegrationResult TestWithAutomation(PrinterConfiguration configuration)
+    {
+        return WithAutomationFormat(
+            configuration,
+            format =>
+            {
+                _ = Convert.ToString(format.GetNamedSubStringValue(configuration.SnDataSourceName));
+                return new IntegrationResult(
+                    true,
+                    $"BarTender 2016 Automation 模板可用: {IOPath.GetFileName(configuration.TemplatePath)}");
+            });
+    }
+
+    private static IntegrationResult PrintWithAutomation(
+        PrinterConfiguration configuration,
+        string packageSn)
+    {
+        return WithAutomationFormat(
+            configuration,
+            format =>
+            {
+                format.SetNamedSubStringValue(configuration.SnDataSourceName, packageSn);
+                format.IdenticalCopiesOfLabel = configuration.Copies;
+                var result = format.PrintOut(false, false);
+                var resultCode = Convert.ToInt32(result);
+                return resultCode == 0
+                    ? new IntegrationResult(true, $"BarTender 标签打印成功: {packageSn}")
+                    : new IntegrationResult(false, $"BarTender 打印失败，返回码: {resultCode}");
+            });
+    }
+
+    private static IntegrationResult WithAutomationFormat(
+        PrinterConfiguration configuration,
+        Func<dynamic, IntegrationResult> operation)
+    {
+        var applicationType = Type.GetTypeFromProgID("BarTender.Application", throwOnError: true)
+            ?? throw new InvalidOperationException("未注册 BarTender.Application 自动化接口。");
+        dynamic application = Activator.CreateInstance(applicationType)
+            ?? throw new InvalidOperationException("无法启动 BarTender Automation。");
+        dynamic? format = null;
+        try
+        {
+            application.Visible = false;
+            var printerName = configuration.PrinterName ?? string.Empty;
+            format = application.Formats.Open(
+                IOPath.GetFullPath(configuration.TemplatePath),
+                false,
+                printerName);
+            return operation(format);
+        }
+        finally
+        {
+            if (format is not null)
+            {
+                try
+                {
+                    format.Close(1); // btDoNotSaveChanges
+                }
+                catch
+                {
+                }
+                ReleaseComObject(format);
+            }
+
+            try
+            {
+                application.Quit(1); // btDoNotSaveChanges
+            }
+            catch
+            {
+            }
+            ReleaseComObject(application);
+        }
+    }
+
+    private static void ReleaseComObject(object value)
+    {
+        if (Marshal.IsComObject(value))
+        {
+            Marshal.FinalReleaseComObject(value);
+        }
     }
 
     private static IntegrationResult WithFormat(
@@ -291,7 +402,7 @@ public sealed class BarTenderSdkAdapter : IBarTenderSdkAdapter
         }
 
         throw new FileNotFoundException(
-            "未找到 Seagull.BarTender.Print.dll。请安装 BarTender 2022 SDK，或配置 barTenderSdkAssemblyPath。");
+            "未找到 Seagull.BarTender.Print.dll。请安装 BarTender .NET SDK，或配置 barTenderSdkAssemblyPath。");
     }
 
     private static IEnumerable<string> BarTenderInstallRoots()

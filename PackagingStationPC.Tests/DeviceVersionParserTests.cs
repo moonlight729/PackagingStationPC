@@ -33,4 +33,12 @@ public sealed class DeviceVersionParserTests
     {
         Assert.Null(DeviceVersionParser.ParseBandHand(">>>>> help\r\nunknown command"));
     }
+
+    [Fact]
+    public void ParseBandSerial_ReturnsFactorySerialNumber()
+    {
+        const string output = ">>>>> sn\r\nI (1) factory: [ok]sn=V61S1.0-C62100000042326\r\n>>>>>";
+
+        Assert.Equal("V61S1.0-C62100000042326", DeviceVersionParser.ParseBandSerial(output));
+    }
 }

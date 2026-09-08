@@ -1,5 +1,3 @@
-using System.Reflection;
-using System.Text;
 using PackagingStationPC.Models;
 
 namespace PackagingStationPC.Services;
@@ -82,50 +80,6 @@ public sealed class AdbClient
             timeout,
             cancellationToken);
 
-    public async Task<ProcessResult> RunEmbeddedPythonAsync(
-        string serial,
-        string resourceFileName,
-        bool useSudo,
-        CancellationToken cancellationToken = default)
-    {
-        var source = ReadEmbeddedResource(resourceFileName);
-        var uniqueName = $"packaging-station-{Guid.NewGuid():N}.py";
-        var localPath = Path.Combine(Path.GetTempPath(), uniqueName);
-        var remotePath = $"/tmp/{uniqueName}";
-        var interpreter = useSudo ? "sudo -n python3" : "python3";
-        try
-        {
-            await File.WriteAllTextAsync(localPath, source, new UTF8Encoding(false), cancellationToken);
-            var push = await _processRunner.RunAsync(
-                _configuration.Path,
-                ["-s", serial, "push", localPath, remotePath],
-                TimeSpan.FromSeconds(_configuration.CommandTimeoutSeconds),
-                cancellationToken);
-            EnsureSuccess(push, $"上传临时查询程序 {resourceFileName}");
-
-            return await ShellAsync(
-                serial,
-                $"{interpreter} {ShellQuote(remotePath)}",
-                TimeSpan.FromSeconds(_configuration.PeripheralTimeoutSeconds),
-                cancellationToken);
-        }
-        finally
-        {
-            TryDeleteLocalFile(localPath);
-            try
-            {
-                await ShellAsync(
-                    serial,
-                    $"rm -f {ShellQuote(remotePath)}",
-                    TimeSpan.FromSeconds(_configuration.CommandTimeoutSeconds),
-                    CancellationToken.None);
-            }
-            catch
-            {
-            }
-        }
-    }
-
     private static AdbDeviceInfo? ParseDeviceLine(string line)
     {
         var tokens = line.Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
@@ -134,8 +88,7 @@ public sealed class AdbClient
             return null;
         }
 
-        var description = string.Join(' ', tokens.Skip(2));
-        return new AdbDeviceInfo(tokens[0], tokens[1], description);
+        return new AdbDeviceInfo(tokens[0], tokens[1], string.Join(' ', tokens.Skip(2)));
     }
 
     private static void EnsureSuccess(ProcessResult result, string operation)
@@ -149,30 +102,5 @@ public sealed class AdbClient
             ? "执行超时"
             : string.IsNullOrWhiteSpace(result.StandardError) ? result.StandardOutput : result.StandardError;
         throw new InvalidOperationException($"{operation}失败: {reason}");
-    }
-
-    private static string ReadEmbeddedResource(string fileName)
-    {
-        var assembly = Assembly.GetExecutingAssembly();
-        var resourceName = assembly.GetManifestResourceNames()
-            .SingleOrDefault(name => name.EndsWith(fileName, StringComparison.OrdinalIgnoreCase))
-            ?? throw new InvalidOperationException($"缺少内嵌设备查询资源 {fileName}。");
-        using var stream = assembly.GetManifestResourceStream(resourceName)
-            ?? throw new InvalidOperationException($"无法打开内嵌设备查询资源 {fileName}。");
-        using var reader = new StreamReader(stream, Encoding.UTF8);
-        return reader.ReadToEnd();
-    }
-
-    private static string ShellQuote(string value) => $"'{value.Replace("'", "'\\\"'\\\"'")}'";
-
-    private static void TryDeleteLocalFile(string path)
-    {
-        try
-        {
-            File.Delete(path);
-        }
-        catch
-        {
-        }
     }
 }

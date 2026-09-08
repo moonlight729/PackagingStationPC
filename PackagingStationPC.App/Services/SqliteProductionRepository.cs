@@ -169,13 +169,13 @@ public sealed class SqliteProductionRepository : IProductionRepository
         SnParts requestedParts,
         CancellationToken cancellationToken = default)
     {
-        ArgumentException.ThrowIfNullOrWhiteSpace(snapshot.AdbSerial);
+        ArgumentException.ThrowIfNullOrWhiteSpace(snapshot.DeviceSerial);
         _snGenerator.Validate(requestedParts);
 
         await using var connection = await OpenAsync(cancellationToken);
         await using var transaction = connection.BeginTransaction(deferred: false);
 
-        var existing = await GetByDeviceSerialAsync(connection, transaction, snapshot.AdbSerial, cancellationToken);
+        var existing = await GetByDeviceSerialAsync(connection, transaction, snapshot.DeviceSerial, cancellationToken);
         if (existing is not null)
         {
             await transaction.CommitAsync(cancellationToken);
@@ -215,7 +215,7 @@ public sealed class SqliteProductionRepository : IProductionRepository
             insertCommand.Parameters.AddWithValue("$year", requestedParts.Year);
             insertCommand.Parameters.AddWithValue("$week", requestedParts.Week);
             insertCommand.Parameters.AddWithValue("$sequence", requestedParts.Sequence);
-            insertCommand.Parameters.AddWithValue("$deviceSerial", snapshot.AdbSerial);
+            insertCommand.Parameters.AddWithValue("$deviceSerial", snapshot.DeviceSerial);
             insertCommand.Parameters.AddWithValue("$snapshot", JsonSerializer.Serialize(snapshot, JsonOptions));
             insertCommand.Parameters.AddWithValue("$uploadStatus", IntegrationStatus.Pending.ToString());
             insertCommand.Parameters.AddWithValue("$printStatus", IntegrationStatus.Pending.ToString());
@@ -238,6 +238,99 @@ public sealed class SqliteProductionRepository : IProductionRepository
         await transaction.CommitAsync(cancellationToken);
         var record = await GetByIdAsync(id, cancellationToken)
             ?? throw new InvalidOperationException("SN 已预留，但无法读取生产记录。");
+        return new ReservationResult(record, false);
+    }
+
+    public async Task<ReservationResult> BindScannedPackageAsync(
+        string packageCode,
+        DeviceVersionSnapshot snapshot,
+        string productCode,
+        string productName,
+        string stationCode,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(packageCode);
+        ArgumentException.ThrowIfNullOrWhiteSpace(snapshot.DeviceSerial);
+        ArgumentException.ThrowIfNullOrWhiteSpace(productCode);
+        packageCode = packageCode.Trim();
+
+        await using var connection = await OpenAsync(cancellationToken);
+        await using var transaction = connection.BeginTransaction(deferred: false);
+        var byPackage = await GetByPackageSnAsync(connection, transaction, packageCode, cancellationToken);
+        var byDevice = await GetByDeviceSerialAsync(connection, transaction, snapshot.DeviceSerial, cancellationToken);
+
+        if (byPackage is not null && !string.Equals(
+                byPackage.DeviceSerial, snapshot.DeviceSerial, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException($"外包装盒码 {packageCode} 已绑定设备 {byPackage.DeviceSerial}，禁止重复绑定。");
+        }
+
+        if (byDevice is not null && !string.Equals(
+                byDevice.PackageSn, packageCode, StringComparison.OrdinalIgnoreCase))
+        {
+            if (byDevice.UploadStatus == IntegrationStatus.Succeeded)
+            {
+                throw new InvalidOperationException($"设备 {snapshot.DeviceSerial} 已成功上传并绑定外包装盒码 {byDevice.PackageSn}，禁止修改。");
+            }
+
+            await using var update = connection.CreateCommand();
+            update.Transaction = transaction;
+            update.CommandText = """
+                UPDATE production_records
+                SET package_sn=$sn, product_code=$product, product_name=$productName,
+                    station_code=$stationCode, version_snapshot_json=$snapshot,
+                    upload_status=$uploadStatus, upload_message='', uploaded_at=NULL
+                WHERE id=$id;
+                """;
+            update.Parameters.AddWithValue("$sn", packageCode);
+            update.Parameters.AddWithValue("$product", productCode.Trim());
+            update.Parameters.AddWithValue("$productName", productName?.Trim() ?? string.Empty);
+            update.Parameters.AddWithValue("$stationCode", stationCode?.Trim() ?? string.Empty);
+            update.Parameters.AddWithValue("$snapshot", JsonSerializer.Serialize(snapshot, JsonOptions));
+            update.Parameters.AddWithValue("$uploadStatus", IntegrationStatus.Pending.ToString());
+            update.Parameters.AddWithValue("$id", byDevice.Id);
+            await update.ExecuteNonQueryAsync(cancellationToken);
+            await transaction.CommitAsync(cancellationToken);
+            var rebound = await GetByIdAsync(byDevice.Id, cancellationToken)
+                ?? throw new InvalidOperationException("扫码绑定已更新，但无法读取生产记录。");
+            return new ReservationResult(rebound, false);
+        }
+
+        var existing = byPackage ?? byDevice;
+        if (existing is not null)
+        {
+            await transaction.CommitAsync(cancellationToken);
+            return new ReservationResult(existing, true);
+        }
+
+        var now = DateTimeOffset.Now;
+        await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            INSERT INTO production_records(
+                package_sn, product_code, product_name, station_code, factory_code, package_year,
+                package_week, sequence, device_serial, version_snapshot_json,
+                upload_status, print_status, created_at)
+            VALUES(
+                $sn, $product, $productName, $stationCode, '', 0,
+                0, 0, $deviceSerial, $snapshot,
+                $uploadStatus, $printStatus, $createdAt);
+            SELECT last_insert_rowid();
+            """;
+        command.Parameters.AddWithValue("$sn", packageCode);
+        command.Parameters.AddWithValue("$product", productCode.Trim());
+        command.Parameters.AddWithValue("$productName", productName?.Trim() ?? string.Empty);
+        command.Parameters.AddWithValue("$stationCode", stationCode?.Trim() ?? string.Empty);
+        command.Parameters.AddWithValue("$deviceSerial", snapshot.DeviceSerial.Trim());
+        command.Parameters.AddWithValue("$snapshot", JsonSerializer.Serialize(snapshot, JsonOptions));
+        command.Parameters.AddWithValue("$uploadStatus", IntegrationStatus.Pending.ToString());
+        command.Parameters.AddWithValue("$printStatus", IntegrationStatus.Pending.ToString());
+        command.Parameters.AddWithValue("$createdAt", FormatDate(now));
+        var id = Convert.ToInt64(await command.ExecuteScalarAsync(cancellationToken), CultureInfo.InvariantCulture);
+        await transaction.CommitAsync(cancellationToken);
+
+        var record = await GetByIdAsync(id, cancellationToken)
+            ?? throw new InvalidOperationException("扫码绑定已保存，但无法读取生产记录。");
         return new ReservationResult(record, false);
     }
 
@@ -369,6 +462,20 @@ public sealed class SqliteProductionRepository : IProductionRepository
         command.Transaction = transaction;
         command.CommandText = "SELECT * FROM production_records WHERE device_serial=$serial LIMIT 1;";
         command.Parameters.AddWithValue("$serial", serial);
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        return await reader.ReadAsync(cancellationToken) ? ReadRecord(reader) : null;
+    }
+
+    private static async Task<ProductionRecord?> GetByPackageSnAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        string packageSn,
+        CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = "SELECT * FROM production_records WHERE package_sn=$sn LIMIT 1;";
+        command.Parameters.AddWithValue("$sn", packageSn);
         await using var reader = await command.ExecuteReaderAsync(cancellationToken);
         return await reader.ReadAsync(cancellationToken) ? ReadRecord(reader) : null;
     }

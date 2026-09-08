@@ -37,11 +37,16 @@ public sealed class SwiftMomFactoryUploadService : IFactoryUploadService, IDispo
     private readonly FactorySystemConfiguration _configuration;
     private readonly HttpClient _httpClient;
     private readonly bool _ownsHttpClient;
+    private readonly AppLogger? _logger;
 
-    public SwiftMomFactoryUploadService(FactorySystemConfiguration configuration, HttpClient? httpClient = null)
+    public SwiftMomFactoryUploadService(
+        FactorySystemConfiguration configuration,
+        HttpClient? httpClient = null,
+        AppLogger? logger = null)
     {
         _configuration = configuration;
         _ownsHttpClient = httpClient is null;
+        _logger = logger;
         _httpClient = httpClient ?? new HttpClient();
         _httpClient.BaseAddress ??= new Uri(configuration.BaseUrl.TrimEnd('/') + "/", UriKind.Absolute);
         _httpClient.Timeout = TimeSpan.FromSeconds(Math.Clamp(configuration.TimeoutSeconds, 1, 120));
@@ -82,7 +87,9 @@ public sealed class SwiftMomFactoryUploadService : IFactoryUploadService, IDispo
 
         try
         {
+            await LogAsync("INFO", $"SwiftMOM upload start pcbSeq={record.PackageSn}, prodNo={_configuration.ProdNo}, stationNo={_configuration.StationNo}");
             var login = await LoginAsync(cancellationToken);
+            await LogStageAsync("clientLogin", login);
             if (!login.IsMesSuccess || string.IsNullOrWhiteSpace(login.Token))
             {
                 return new IntegrationResult(false, DescribeFailure("SwiftMOM 登录", login));
@@ -99,6 +106,7 @@ public sealed class SwiftMomFactoryUploadService : IFactoryUploadService, IDispo
                 },
                 login.Token,
                 cancellationToken);
+            await LogStageAsync("checkRoute", check);
             if (!check.IsMesSuccess)
             {
                 return new IntegrationResult(false, DescribeFailure("过站检查", check), check.Body);
@@ -109,12 +117,14 @@ public sealed class SwiftMomFactoryUploadService : IFactoryUploadService, IDispo
                 CreateRoutePayload(record),
                 login.Token,
                 cancellationToken);
+            await LogStageAsync("createRoute", create);
             return create.IsMesSuccess
                 ? new IntegrationResult(true, $"SwiftMOM 过站成功: {record.PackageSn}", create.Body)
                 : new IntegrationResult(false, DescribeFailure("过站写入", create), create.Body);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
+            await LogAsync("ERROR", $"SwiftMOM upload exception pcbSeq={record.PackageSn}: {ex}");
             return new IntegrationResult(false, $"SwiftMOM 上传失败: {ex.Message}");
         }
     }
@@ -143,23 +153,26 @@ public sealed class SwiftMomFactoryUploadService : IFactoryUploadService, IDispo
         prodNo = _configuration.ProdNo,
         stationNo = _configuration.StationNo,
         result = "PASS",
-        remark = CreateVersionRemark(record),
+        remark = string.Empty,
         testItem = string.Empty,
         userNo = _configuration.UserNo,
         weight = 0d,
         packNo = string.Empty,
-        rmk1 = string.Empty,
+        rmk1 = CreateVersionString(record),
         rmk2 = string.Empty,
         rmk3 = string.Empty,
         rmk4 = string.Empty,
         testDetail = Array.Empty<object>()
     };
 
-    private static string CreateVersionRemark(ProductionRecord record)
+    private static string CreateVersionString(ProductionRecord record)
     {
-        var versions = new Dictionary<string, Dictionary<string, string>>(StringComparer.OrdinalIgnoreCase);
+        var versions = new Dictionary<string, object>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["deviceSn"] = record.DeviceSerial
+        };
         foreach (var component in record.VersionSnapshot.Components.Where(component =>
-                     component.Component is "glasses" or "band"))
+                     component.Component is "box" or "glasses" or "band"))
         {
             versions[component.Component] = new Dictionary<string, string>(
                 component.Values,
@@ -254,6 +267,13 @@ public sealed class SwiftMomFactoryUploadService : IFactoryUploadService, IDispo
         return $"{operation}失败: msgId={response.MsgId}, {response.MsgStr}".TrimEnd(' ', ',');
     }
 
+    private Task LogStageAsync(string stage, SwiftMomResponse response) => LogAsync(
+        response.IsMesSuccess ? "INFO" : "ERROR",
+        $"SwiftMOM stage={stage}, http={response.StatusCode}, msgId={response.MsgId?.ToString() ?? "null"}, msgStr={response.MsgStr}");
+
+    private Task LogAsync(string level, string message) =>
+        _logger?.WriteAsync(level, message) ?? Task.CompletedTask;
+
     private static int? ReadMsgId(JsonElement root)
     {
         if (!root.TryGetProperty("msgId", out var value))
@@ -299,8 +319,8 @@ public sealed class SwiftMomFactoryUploadService : IFactoryUploadService, IDispo
 
 public static class FactoryUploadServiceFactory
 {
-    public static IFactoryUploadService Create(FactorySystemConfiguration configuration) =>
+    public static IFactoryUploadService Create(FactorySystemConfiguration configuration, AppLogger? logger = null) =>
         string.Equals(configuration.Mode, "swiftmom", StringComparison.OrdinalIgnoreCase)
-            ? new SwiftMomFactoryUploadService(configuration)
+            ? new SwiftMomFactoryUploadService(configuration, logger: logger)
             : new MockFactoryUploadService();
 }

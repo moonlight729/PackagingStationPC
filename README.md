@@ -5,22 +5,26 @@ Origin Kit Gen1 包装工位上位机。该工程与 `spaceTestPC` 完全独立�
 ## 功能
 
 - 采集眼镜和左右手环版本，不读取主机应用或主机系统版本。
-- 按 `G1 + 包装厂代码 + 两位年份 + 两位周次 + 六位流水号` 生成外包装 SN。
-- 使用 SQLite 事务预留 SN，防止程序重启、上传重试或重复设备造成重号。
+- 接收 USB HID 扫码枪输入，将外包装盒码直接作为 SwiftMOM `pcbSeq`。
+- 扫码后自动采集设备 SN 和版本，并使用 SQLite 事务保存盒码、设备与版本绑定关系。
 - 工厂系统上传支持 `mock` 和 SwiftMOM 三步过站实现。
-- 标签打印支持 `mock`、Windows 自绘和 BarTender 2022 模板三种实现。
-- 上传和打印分别记录状态，可以单独联调和重试。
+- 标签打印当前已从界面和运行流程中停用，保留原适配源码供后续需要时恢复。
+- 上传状态独立记录，可以联调和重试。
 
 示例：`G1F2632000001`。
+
+## 扫码流程
+
+扫码枪按标准 USB 键盘模式接入。程序收到 Enter、换行或输入停止 500ms 后提交盒码，随后自动读取设备 SN 和版本、保存本地绑定、调用 SwiftMOM 三步接口。上传失败时保留当前记录以便重试；上传成功后点击“下一台设备”继续扫码。已成功上传的盒码与设备绑定禁止修改，未成功上传的旧绑定可由下一次扫码纠正。
 
 ## 版本采集
 
 眼镜查询协议作为 EXE 内嵌资源发布。查询时程序通过 ADB 将对应查询程序临时推送到设备 `/tmp`，执行完成后立即删除。设备不需要预装查询脚本，查询文件也不会持久保留：
 
-- 眼镜：打开 `/dev/cam0_acm1` 或 `/dev/ttyACM1`，使用 921600 8N1，发送 YCTC UART v3 `0xA4` 版本请求，最多竞争读取 8 轮。
+- 眼镜：通过 ADB shell 打开 `/dev/cam0_acm1` 或 `/dev/ttyACM1`，使用 921600 8N1 传输原始字节；C# 构造并解析 YCTC UART v3 帧，发送 `0xA4` 读取版本，发送 `0xB5` 并解析 `0xB6/0xB7` 读取 SN。
 - 手环：由 C# 上位机直接枚举 Windows COM 口，优先选择 USB VID/PID `303A:1001` 的当前串口；若注册表无法提供 USB 身份才回退为逐个串口探测。串口参数为 2000000 8N1、DTR/RTS 开启；先发送 `hand` 判定左右手，再发送 `version`，只保存其中的版本号。命令按字节发送并处理 `>>>>>` 控制台提示符，不经过 ADB，也不依赖 Python。
 
-眼镜查询仍要求设备端有 `python3`，并且 ADB 用户能够写入 `/tmp` 和访问眼镜串口。手环查询只要求 Windows 已正确安装手环的 USB 串口驱动，不需要设备端环境。
+眼镜查询不依赖 Python；YCTC 构帧、CRC 和响应解析全部由 C# 完成。设备端只需提供 `stty`、`timeout`、`base64`、`dd` 等基础命令，并允许访问眼镜串口。手环查询要求 Windows 已正确安装手环的 USB 串口驱动。
 
 ## 配置
 
@@ -44,14 +48,16 @@ Origin Kit Gen1 包装工位上位机。该工程与 `spaceTestPC` 完全独立�
 }
 ```
 
-`mode` 为 `swiftmom` 时，每次上传依次调用 `clientLogin`、`checkRoute` 和 `createRoute`。外包装 SN 作为 `pcbSeq`；只有 `checkRoute` 返回 `msgId=0` 才会写入过站数据。眼镜和左右手环版本会序列化为紧凑 JSON 字符串写入 `remark`。`mode` 为 `mock` 时只执行本地模拟，不访问 MES。
+`mode` 为 `swiftmom` 时，每次上传依次调用 `clientLogin`、`checkRoute` 和 `createRoute`。外包装 SN 作为 `pcbSeq`；只有 `checkRoute` 返回 `msgId=0` 才会写入过站数据。眼镜和左右手环版本会序列化为紧凑 JSON 字符串写入 `rmk1`，`remark` 保持为空。`mode` 为 `mock` 时只执行本地模拟，不访问 MES。
 
-调试打印机：
+生产页可以修改并保存 `prodNo` 和 `stationNo`，保存后立即用于后续上传并写回应用目录的 `appsettings.json`。日志记录扫码、版本值、本地绑定及 SwiftMOM 各阶段结果，默认位于 `%LOCALAPPDATA%\OriginFlow\PackagingStationPC\packaging-station.log`；密码和 token 不写日志。
+
+打印配置当前固定为停用模式：
 
 ```json
 "printer": {
-  "mode": "bartender",
-  "printerName": "生产标签打印机",
+  "mode": "mock",
+  "printerName": "",
   "templatePath": "D:\\BarTenderTemplates\\OriginKitGen1.btw",
   "snDataSourceName": "PackageSn",
   "barTenderSdkAssemblyPath": "",
@@ -62,14 +68,14 @@ Origin Kit Gen1 包装工位上位机。该工程与 `spaceTestPC` 完全独立�
 }
 ```
 
-`bartender` 模式需要安装 BarTender 2022 SDK，并在 `.btw` 模板中建立名为 `PackageSn` 的命名数据源。上位机将当前 SN 写入该数据源，标签中的 QR Code 或 Code 128 类型由模板决定。`barTenderSdkAssemblyPath` 留空时自动查找 `Seagull.BarTender.Print.dll`；也可填写 DLL 的绝对路径。打印机仍可在“打印调试”页临时选择。`windows` 模式保留原有 WPF 自绘标签打印，`mock` 模式不发送真实任务。
+打印服务当前不在应用启动和生产工作流中实例化，界面也不提供打印入口。`PrinterServices.cs` 中仅保留原适配源码。
 
 生产模式建议保持：
 
 ```json
 "workflow": {
   "requireUploadBeforeNext": true,
-  "requirePrintBeforeNext": true
+  "requirePrintBeforeNext": false
 }
 ```
 

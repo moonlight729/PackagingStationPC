@@ -45,16 +45,20 @@ public sealed class SwiftMomFactoryUploadServiceTests
         Assert.Equal(0, create.RootElement.GetProperty("weight").GetDouble());
         Assert.Empty(create.RootElement.GetProperty("testDetail").EnumerateArray());
 
-        var remarkJson = create.RootElement.GetProperty("remark").GetString();
-        Assert.NotNull(remarkJson);
-        using var remark = JsonDocument.Parse(remarkJson);
-        Assert.False(remark.RootElement.TryGetProperty("host_app", out _));
-        Assert.False(remark.RootElement.TryGetProperty("host_system", out _));
+        Assert.Equal(string.Empty, create.RootElement.GetProperty("remark").GetString());
+        var versionJson = create.RootElement.GetProperty("rmk1").GetString();
+        Assert.NotNull(versionJson);
+        using var versions = JsonDocument.Parse(versionJson);
+        Assert.False(versions.RootElement.TryGetProperty("host_app", out _));
+        Assert.False(versions.RootElement.TryGetProperty("host_system", out _));
+        Assert.Equal("device-001", versions.RootElement.GetProperty("deviceSn").GetString());
         Assert.Equal(
             "V0.0.7-260822.141149-f7ee5ba46",
-            remark.RootElement.GetProperty("glasses").GetProperty("app").GetString());
-        Assert.Equal("3.0.3.3", remark.RootElement.GetProperty("band").GetProperty("left").GetString());
-        Assert.Equal("3.0.3.2", remark.RootElement.GetProperty("band").GetProperty("right").GetString());
+            versions.RootElement.GetProperty("glasses").GetProperty("app").GetString());
+        Assert.Equal("LEFT-SN", versions.RootElement.GetProperty("band").GetProperty("leftSn").GetString());
+        Assert.Equal("3.0.3.3", versions.RootElement.GetProperty("band").GetProperty("leftVersion").GetString());
+        Assert.Equal("RIGHT-SN", versions.RootElement.GetProperty("band").GetProperty("rightSn").GetString());
+        Assert.Equal("3.0.3.2", versions.RootElement.GetProperty("band").GetProperty("rightVersion").GetString());
     }
 
     [Fact]
@@ -105,6 +109,7 @@ public sealed class SwiftMomFactoryUploadServiceTests
     private static ProductionRecord Record() => new()
     {
         PackageSn = "G1F2632000001",
+        DeviceSerial = "device-001",
         VersionSnapshot = new DeviceVersionSnapshot
         {
             Components =
@@ -125,8 +130,10 @@ public sealed class SwiftMomFactoryUploadServiceTests
                     Component = "band",
                     Values = new Dictionary<string, string>
                     {
-                        ["left"] = "3.0.3.3",
-                        ["right"] = "3.0.3.2"
+                        ["leftSn"] = "LEFT-SN",
+                        ["leftVersion"] = "3.0.3.3",
+                        ["rightSn"] = "RIGHT-SN",
+                        ["rightVersion"] = "3.0.3.2"
                     }
                 }
             ]

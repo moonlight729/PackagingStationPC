@@ -13,6 +13,13 @@ public interface IProductionRepository
         string stationCode,
         SnParts requestedParts,
         CancellationToken cancellationToken = default);
+    Task<ReservationResult> BindScannedPackageAsync(
+        string packageCode,
+        DeviceVersionSnapshot snapshot,
+        string productCode,
+        string productName,
+        string stationCode,
+        CancellationToken cancellationToken = default);
     Task<ProductionRecord?> GetByIdAsync(long id, CancellationToken cancellationToken = default);
     Task UpdateUploadAsync(long id, IntegrationResult result, CancellationToken cancellationToken = default);
     Task UpdatePrintAsync(long id, IntegrationResult result, CancellationToken cancellationToken = default);

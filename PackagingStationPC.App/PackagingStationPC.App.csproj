@@ -12,7 +12,6 @@
   <ItemGroup>
     <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.0" />
     <PackageReference Include="System.IO.Ports" Version="10.0.0" />
-    <EmbeddedResource Include="DeviceQueries\glasses_version_query.py" />
     <None Update="appsettings.json">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>

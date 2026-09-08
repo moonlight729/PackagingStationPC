@@ -16,8 +16,10 @@ public sealed partial class BandSerialVersionService : IBandSerialVersionService
 {
     internal const int BaudRate = 2_000_000;
     private const int HandQueryAttempts = 3;
+    private const int SnQueryAttempts = 2;
     private const int VersionQueryAttempts = 2;
     private static readonly TimeSpan HandTimeout = TimeSpan.FromMilliseconds(1500);
+    private static readonly TimeSpan SnTimeout = TimeSpan.FromSeconds(2);
     private static readonly TimeSpan VersionTimeout = TimeSpan.FromSeconds(2);
     private static readonly byte[] ConsoleResync = "\u001b[1;1R\r\n\r\n"u8.ToArray();
 
@@ -71,14 +73,17 @@ public sealed partial class BandSerialVersionService : IBandSerialVersionService
                 AddUnique(errors, $"{failed.PortName}: {failed.Error}");
             }
 
-            var selected = matches.FirstOrDefault(item => !string.IsNullOrWhiteSpace(item.Version));
+            var selected = matches.FirstOrDefault(item => !string.IsNullOrWhiteSpace(item.Serial));
             if (selected is null)
             {
-                AddUnique(errors, $"未读取到{HandDisplayName(hand)}手手环版本");
+                AddUnique(errors, $"未读取到{HandDisplayName(hand)}手手环 SN");
+                values[$"{hand}Sn"] = string.Empty;
+                values[$"{hand}Version"] = string.Empty;
                 continue;
             }
 
-            values[hand] = selected.Version!;
+            values[$"{hand}Sn"] = selected.Serial!;
+            values[$"{hand}Version"] = selected.Version ?? string.Empty;
             sourcePorts.Add(selected.PortName);
         }
 
@@ -91,7 +96,7 @@ public sealed partial class BandSerialVersionService : IBandSerialVersionService
             }
         }
 
-        var hasAnyVersion = values.ContainsKey("left") || values.ContainsKey("right");
+        var hasBothSerials = values.ContainsKey("leftSn") && values.ContainsKey("rightSn");
         var source = sourcePorts.Count > 0
             ? $"本机串口 {BaudRate} 8N1: {string.Join(", ", sourcePorts)}"
             : $"本机串口 {BaudRate} 8N1";
@@ -102,7 +107,7 @@ public sealed partial class BandSerialVersionService : IBandSerialVersionService
             Required = true,
             State = errors.Count == 0
                 ? QueryState.Success
-                : hasAnyVersion ? QueryState.Warning : QueryState.Failed,
+                : hasBothSerials ? QueryState.Warning : QueryState.Failed,
             Source = source,
             Message = string.Join("; ", errors),
             Values = values
@@ -160,6 +165,22 @@ public sealed partial class BandSerialVersionService : IBandSerialVersionService
                 $"hand 命令重试 {HandQueryAttempts} 次仍无有效响应{ResponseSuffix(handResponse)}");
         }
 
+        string snResponse = string.Empty;
+        string? sn = null;
+        for (var attempt = 1; attempt <= SnQueryAttempts && sn is null; attempt++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            port.DiscardInBuffer();
+            await WriteLinePacedAsync(port, "sn", cancellationToken);
+            await Task.Delay(50, cancellationToken);
+            snResponse = await ReadUntilAsync(port, "sn=", SnTimeout, TimeSpan.FromMilliseconds(350), cancellationToken);
+            sn = DeviceVersionParser.ParseBandSerial(snResponse);
+            if (sn is null && attempt < SnQueryAttempts)
+            {
+                await Task.Delay(300, cancellationToken);
+            }
+        }
+
         string versionResponse = string.Empty;
         string? version = null;
         for (var attempt = 1; attempt <= VersionQueryAttempts && version is null; attempt++)
@@ -176,13 +197,23 @@ public sealed partial class BandSerialVersionService : IBandSerialVersionService
             }
         }
 
+        if (sn is null)
+        {
+            return new BandProbe(
+                portName,
+                hand,
+                version,
+                $"sn 命令重试 {SnQueryAttempts} 次仍无 SN{ResponseSuffix(snResponse)}");
+        }
+
         return version is not null
-            ? new BandProbe(portName, hand, version, null)
+            ? new BandProbe(portName, hand, version, null, sn)
             : new BandProbe(
                 portName,
                 hand,
                 null,
-                $"version 命令重试 {VersionQueryAttempts} 次仍无版本号{ResponseSuffix(versionResponse)}");
+                $"version 命令重试 {VersionQueryAttempts} 次仍无版本号{ResponseSuffix(versionResponse)}",
+                sn);
     }
 
     private static async Task ResyncConsoleAsync(SerialPort port, CancellationToken cancellationToken)
@@ -350,7 +381,8 @@ public sealed partial class BandSerialVersionService : IBandSerialVersionService
         string PortName,
         string? Hand,
         string? Version,
-        string? Error);
+        string? Error,
+        string? Serial = null);
 
     [GeneratedRegex("^COM(?<number>\\d+)$", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
     private static partial Regex ComPortNumberRegex();

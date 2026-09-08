@@ -11,7 +11,7 @@ public sealed class MainViewModel : ObservableObject
     private readonly SnGenerator _snGenerator;
     private readonly IProductionRepository _repository;
     private readonly IFactoryUploadService _uploadService;
-    private readonly ILabelPrinterService _printerService;
+    private readonly ScannerService _scannerService;
     private readonly AppLogger _logger;
     private AdbDeviceInfo? _selectedDevice;
     private DeviceVersionSnapshot? _snapshot;
@@ -23,7 +23,10 @@ public sealed class MainViewModel : ObservableObject
     private bool _isBusy;
     private string _statusMessage = "正在初始化...";
     private string _moduleMessage = string.Empty;
-    private string _selectedPrinter = string.Empty;
+    private string _scannerInput = string.Empty;
+    private string _scannedPackageCode = string.Empty;
+    private string _configuredProdNo;
+    private string _configuredStationNo;
 
     public MainViewModel(
         AppConfiguration configuration,
@@ -31,7 +34,7 @@ public sealed class MainViewModel : ObservableObject
         SnGenerator snGenerator,
         IProductionRepository repository,
         IFactoryUploadService uploadService,
-        ILabelPrinterService printerService,
+        ScannerService scannerService,
         AppLogger logger)
     {
         _configuration = configuration;
@@ -39,8 +42,10 @@ public sealed class MainViewModel : ObservableObject
         _snGenerator = snGenerator;
         _repository = repository;
         _uploadService = uploadService;
-        _printerService = printerService;
+        _scannerService = scannerService;
         _logger = logger;
+        _configuredProdNo = configuration.FactorySystem.ProdNo;
+        _configuredStationNo = configuration.FactorySystem.StationNo;
 
         var current = SnGenerator.CurrentIsoYearWeek(DateTime.Today);
         _selectedYear = current.Year;
@@ -63,8 +68,10 @@ public sealed class MainViewModel : ObservableObject
         ReserveSnCommand = new AsyncRelayCommand(() => RunBusyAsync(ReserveSnAsync), CanReserveSn);
         TestUploadCommand = new AsyncRelayCommand(() => RunBusyAsync(TestUploadAsync), () => !IsBusy);
         UploadCommand = new AsyncRelayCommand(() => RunBusyAsync(UploadAsync), () => !IsBusy && CurrentRecord is not null);
-        TestPrinterCommand = new AsyncRelayCommand(() => RunBusyAsync(TestPrinterAsync), () => !IsBusy);
-        PrintCommand = new AsyncRelayCommand(() => RunBusyAsync(PrintAsync), () => !IsBusy && CurrentRecord is not null);
+        ScanCommand = new AsyncRelayCommand(() => RunBusyAsync(ProcessScanAsync),
+            () => !IsBusy && CurrentRecord is null && !string.IsNullOrWhiteSpace(ScannerInput));
+        SaveFactoryConfigurationCommand = new AsyncRelayCommand(
+            () => RunBusyAsync(SaveFactoryConfigurationAsync), () => !IsBusy);
         NextDeviceCommand = new AsyncRelayCommand(() => RunBusyAsync(NextDeviceAsync), CanMoveNext);
         RefreshRecordsCommand = new AsyncRelayCommand(() => RunBusyAsync(RefreshRecordsAsync), () => !IsBusy);
 
@@ -78,10 +85,36 @@ public sealed class MainViewModel : ObservableObject
     public string UploadEndpoint =>
         _configuration.FactorySystem.BaseUrl.TrimEnd('/') + "/" +
         _configuration.FactorySystem.CreateRoutePath.TrimStart('/');
-    public string PrinterMode => _printerService.Mode;
-    public string ConfiguredPrinter => string.IsNullOrWhiteSpace(_configuration.Printer.PrinterName)
-        ? "系统默认打印机"
-        : _configuration.Printer.PrinterName;
+
+    public string ScannerInput
+    {
+        get => _scannerInput;
+        set
+        {
+            if (SetProperty(ref _scannerInput, value))
+            {
+                ScanCommand.RaiseCanExecuteChanged();
+            }
+        }
+    }
+
+    public string ScannedPackageCode
+    {
+        get => _scannedPackageCode;
+        private set => SetProperty(ref _scannedPackageCode, value);
+    }
+
+    public string ConfiguredProdNo
+    {
+        get => _configuredProdNo;
+        set => SetProperty(ref _configuredProdNo, value);
+    }
+
+    public string ConfiguredStationNo
+    {
+        get => _configuredStationNo;
+        set => SetProperty(ref _configuredStationNo, value);
+    }
     public IReadOnlyList<string> FactoryCodes { get; }
     public IReadOnlyList<int> Years { get; }
     public IReadOnlyList<int> Weeks { get; }
@@ -89,22 +122,6 @@ public sealed class MainViewModel : ObservableObject
     public ObservableCollection<AdbDeviceInfo> Devices { get; } = [];
     public ObservableCollection<VersionRowViewModel> VersionRows { get; } = [];
     public ObservableCollection<ProductionRecord> RecentRecords { get; } = [];
-    public ObservableCollection<string> AvailablePrinters { get; } = [];
-
-    public string SelectedPrinter
-    {
-        get => _selectedPrinter;
-        set
-        {
-            if (!SetProperty(ref _selectedPrinter, value))
-            {
-                return;
-            }
-
-            _configuration.Printer.PrinterName = value == "系统默认打印机" ? string.Empty : value;
-            OnPropertyChanged(nameof(ConfiguredPrinter));
-        }
-    }
 
     public AdbDeviceInfo? SelectedDevice
     {
@@ -213,7 +230,6 @@ public sealed class MainViewModel : ObservableObject
             {
                 OnPropertyChanged(nameof(SnPreview));
                 OnPropertyChanged(nameof(CurrentUploadStatus));
-                OnPropertyChanged(nameof(CurrentPrintStatus));
                 OnPropertyChanged(nameof(CurrentDeviceSerial));
                 RaiseCommandStates();
             }
@@ -221,8 +237,7 @@ public sealed class MainViewModel : ObservableObject
     }
 
     public string CurrentUploadStatus => CurrentRecord?.UploadStatus.ToString() ?? "未预留";
-    public string CurrentPrintStatus => CurrentRecord?.PrintStatus.ToString() ?? "未预留";
-    public string CurrentDeviceSerial => CurrentRecord?.DeviceSerial ?? _snapshot?.AdbSerial ?? "-";
+    public string CurrentDeviceSerial => CurrentRecord?.DeviceSerial ?? _snapshot?.DeviceSerial ?? "-";
 
     public AsyncRelayCommand RefreshDevicesCommand { get; }
     public AsyncRelayCommand QueryVersionsCommand { get; }
@@ -231,8 +246,8 @@ public sealed class MainViewModel : ObservableObject
     public AsyncRelayCommand ReserveSnCommand { get; }
     public AsyncRelayCommand TestUploadCommand { get; }
     public AsyncRelayCommand UploadCommand { get; }
-    public AsyncRelayCommand TestPrinterCommand { get; }
-    public AsyncRelayCommand PrintCommand { get; }
+    public AsyncRelayCommand ScanCommand { get; }
+    public AsyncRelayCommand SaveFactoryConfigurationCommand { get; }
     public AsyncRelayCommand NextDeviceCommand { get; }
     public AsyncRelayCommand RefreshRecordsCommand { get; }
 
@@ -244,26 +259,63 @@ public sealed class MainViewModel : ObservableObject
             await LoadNextSequenceAsync();
             await RefreshRecordsAsync();
             await RefreshDevicesAsync();
-            AvailablePrinters.Clear();
-            if (string.Equals(_printerService.Mode, "windows", StringComparison.OrdinalIgnoreCase))
-            {
-                AvailablePrinters.Add("系统默认打印机");
-            }
-            foreach (var printer in _printerService.GetAvailablePrinters())
-            {
-                AvailablePrinters.Add(printer);
-            }
-
-            SelectedPrinter = string.IsNullOrWhiteSpace(_configuration.Printer.PrinterName)
-                ? AvailablePrinters.FirstOrDefault() ?? string.Empty
-                : AvailablePrinters.FirstOrDefault(name => string.Equals(
-                    name,
-                    _configuration.Printer.PrinterName,
-                    StringComparison.OrdinalIgnoreCase)) ?? _configuration.Printer.PrinterName;
-
             StatusMessage = Devices.Count == 0 ? "工位已就绪，未检测到 ADB 设备。" : "工位已就绪。";
-            ModuleMessage = "各模块可独立测试；预留 SN 前必须先读取设备版本。";
+            ModuleMessage = "请扫描外包装盒码，程序将自动读取设备信息并上传。";
         });
+    }
+
+    private async Task ProcessScanAsync()
+    {
+        var packageCode = _scannerService.Normalize(ScannerInput);
+        ScannerInput = string.Empty;
+        if (string.IsNullOrWhiteSpace(packageCode) || packageCode.Length > 128 || packageCode.Any(char.IsControl))
+        {
+            throw new InvalidOperationException("外包装盒码为空、过长或包含控制字符，请重新扫描。");
+        }
+
+        ScannedPackageCode = packageCode;
+        await _logger.WriteAsync("INFO", $"Scan received package={packageCode}, selectedDevice={SelectedDevice?.Serial ?? "auto"}");
+        ModuleMessage = $"已扫描 {packageCode}，正在读取设备 SN 和版本。";
+        await QueryVersionsAsync();
+        if (_snapshot is null)
+        {
+            throw new InvalidOperationException("设备信息读取没有返回结果。");
+        }
+
+        if (_configuration.Adb.RequireCompleteVersionSet && !_snapshot.IsComplete)
+        {
+            throw new InvalidOperationException("必需版本项不完整，绑定和上传已停止。");
+        }
+
+        var reservation = await _repository.BindScannedPackageAsync(
+            packageCode,
+            _snapshot,
+            _configuration.Sn.ProductCode,
+            _configuration.Sn.ProductName,
+            _configuration.StationCode);
+        CurrentRecord = reservation.Record;
+        await _logger.WriteAsync(
+            "INFO",
+            $"Package binding saved package={packageCode}, device={_snapshot.DeviceSerial}, adb={_snapshot.AdbSerial}, existing={reservation.WasExisting}");
+        await RefreshRecordsAsync();
+        await UploadAsync();
+    }
+
+    private async Task SaveFactoryConfigurationAsync()
+    {
+        if (string.IsNullOrWhiteSpace(ConfiguredProdNo) || string.IsNullOrWhiteSpace(ConfiguredStationNo))
+        {
+            throw new InvalidOperationException("工单号和站位编号不能为空。");
+        }
+
+        _configuration.FactorySystem.ProdNo = ConfiguredProdNo.Trim();
+        _configuration.FactorySystem.StationNo = ConfiguredStationNo.Trim();
+        ConfigurationService.Save(_configuration);
+        OnPropertyChanged(nameof(UploadEndpoint));
+        ModuleMessage = $"配置已保存：工单 {_configuration.FactorySystem.ProdNo}，站位 {_configuration.FactorySystem.StationNo}。";
+        await _logger.WriteAsync(
+            "INFO",
+            $"Factory configuration saved prodNo={_configuration.FactorySystem.ProdNo}, stationNo={_configuration.FactorySystem.StationNo}");
     }
 
     private async Task RefreshDevicesAsync()
@@ -302,9 +354,9 @@ public sealed class MainViewModel : ObservableObject
             foreach (var value in component.Values)
             {
                 VersionRows.Add(new VersionRowViewModel(
-                    component.DisplayName,
-                    value.Key,
-                    value.Value,
+                    DisplayComponent(component, value.Key),
+                    DisplayField(value.Key),
+                    string.IsNullOrWhiteSpace(value.Value) ? "未获取" : value.Value,
                     StateText(component.State),
                     component.Source));
             }
@@ -316,13 +368,34 @@ public sealed class MainViewModel : ObservableObject
             : "存在失败或使用历史值的必需版本项，请排查后重新读取。";
         foreach (var component in _snapshot.Components)
         {
+            var values = component.Values.Count == 0
+                ? "none"
+                : string.Join(",", component.Values.Select(item => $"{item.Key}={item.Value}"));
             await _logger.WriteAsync(
                 component.State is QueryState.Success ? "INFO" : "ERROR",
-                $"Version component={component.Component}, state={component.State}, source={component.Source}, message={component.Message}");
+                $"Version component={component.Component}, state={component.State}, values={values}, source={component.Source}, message={component.Message}");
         }
         await _logger.WriteAsync("INFO", $"Version query device={_snapshot.AdbSerial}, complete={_snapshot.IsComplete}");
         RaiseCommandStates();
     }
+
+    private static string DisplayComponent(VersionComponentResult component, string field) => field switch
+    {
+        "leftSn" or "leftVersion" => "左手环",
+        "rightSn" or "rightVersion" => "右手环",
+        _ => component.DisplayName
+    };
+
+    private static string DisplayField(string field) => field switch
+    {
+        "sn" or "leftSn" or "rightSn" => "SN",
+        "leftVersion" or "rightVersion" => "版本",
+        "uboot" => "U-Boot 版本",
+        "kernel" => "Kernel 版本",
+        "rootfs" => "RootFS 版本",
+        "app" => "应用版本",
+        _ => field
+    };
 
     private async Task LoadNextSequenceAsync()
     {
@@ -383,24 +456,6 @@ public sealed class MainViewModel : ObservableObject
         await _logger.WriteAsync(result.Success ? "INFO" : "ERROR", $"Upload sn={record.PackageSn}: {result.Message}");
     }
 
-    private async Task TestPrinterAsync()
-    {
-        var result = await _printerService.TestAsync();
-        ModuleMessage = result.Message;
-        await _logger.WriteAsync(result.Success ? "INFO" : "ERROR", $"Printer test: {result.Message}");
-    }
-
-    private async Task PrintAsync()
-    {
-        var record = CurrentRecord ?? throw new InvalidOperationException("请先预留 SN。");
-        var result = await _printerService.PrintAsync(record);
-        await _repository.UpdatePrintAsync(record.Id, result);
-        CurrentRecord = await _repository.GetByIdAsync(record.Id);
-        ModuleMessage = result.Message;
-        await RefreshRecordsAsync();
-        await _logger.WriteAsync(result.Success ? "INFO" : "ERROR", $"Print sn={record.PackageSn}: {result.Message}");
-    }
-
     private async Task NextDeviceAsync()
     {
         var record = CurrentRecord ?? throw new InvalidOperationException("当前没有已预留的生产记录。");
@@ -409,16 +464,11 @@ public sealed class MainViewModel : ObservableObject
             throw new InvalidOperationException("当前配置要求上传成功后才能进入下一台。");
         }
 
-        if (_configuration.Workflow.RequirePrintBeforeNext && record.PrintStatus != IntegrationStatus.Succeeded)
-        {
-            throw new InvalidOperationException("当前配置要求打印成功后才能进入下一台。");
-        }
-
         CurrentRecord = null;
         _snapshot = null;
+        ScannedPackageCode = string.Empty;
         VersionRows.Clear();
-        ModuleMessage = "已进入下一台，流水号将自动使用数据库中的下一可用值。";
-        await LoadNextSequenceAsync();
+        ModuleMessage = "已进入下一台，请扫描新的外包装盒码。";
         await RefreshDevicesAsync();
     }
 
@@ -499,8 +549,8 @@ public sealed class MainViewModel : ObservableObject
         ReserveSnCommand.RaiseCanExecuteChanged();
         TestUploadCommand.RaiseCanExecuteChanged();
         UploadCommand.RaiseCanExecuteChanged();
-        TestPrinterCommand.RaiseCanExecuteChanged();
-        PrintCommand.RaiseCanExecuteChanged();
+        ScanCommand.RaiseCanExecuteChanged();
+        SaveFactoryConfigurationCommand.RaiseCanExecuteChanged();
         NextDeviceCommand.RaiseCanExecuteChanged();
         RefreshRecordsCommand.RaiseCanExecuteChanged();
     }

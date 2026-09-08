@@ -91,9 +91,57 @@ public sealed class SqliteProductionRepositoryTests : IAsyncLifetime
         Assert.Contains("不能回退复用", error.Message);
     }
 
+    [Fact]
+    public async Task BindScannedPackage_SavesBoxDeviceAndVersions()
+    {
+        var result = await _repository.BindScannedPackageAsync(
+            "BOX-0001",
+            Snapshot("device-scan-1"),
+            "G1",
+            "Origin Kit Gen1",
+            "PACKING-01");
+
+        Assert.False(result.WasExisting);
+        Assert.Equal("BOX-0001", result.Record.PackageSn);
+        Assert.Equal("device-scan-1", result.Record.DeviceSerial);
+        Assert.Equal("3.0.3.3", result.Record.VersionSnapshot.Components.Single().Values["leftVersion"]);
+    }
+
+    [Fact]
+    public async Task BindScannedPackage_CanCorrectFailedBindingButNotSuccessfulBinding()
+    {
+        var first = await _repository.BindScannedPackageAsync(
+            "WRONG-BOX",
+            Snapshot("device-scan-2"),
+            "G1",
+            "Origin Kit Gen1",
+            "PACKING-01");
+        await _repository.UpdateUploadAsync(first.Record.Id, new IntegrationResult(false, "route rejected"));
+
+        var corrected = await _repository.BindScannedPackageAsync(
+            "RIGHT-BOX",
+            Snapshot("device-scan-2"),
+            "G1",
+            "Origin Kit Gen1",
+            "PACKING-01");
+        Assert.Equal(first.Record.Id, corrected.Record.Id);
+        Assert.Equal("RIGHT-BOX", corrected.Record.PackageSn);
+
+        await _repository.UpdateUploadAsync(corrected.Record.Id, new IntegrationResult(true, "uploaded"));
+        var error = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            _repository.BindScannedPackageAsync(
+                "ANOTHER-BOX",
+                Snapshot("device-scan-2"),
+                "G1",
+                "Origin Kit Gen1",
+                "PACKING-01"));
+        Assert.Contains("禁止修改", error.Message);
+    }
+
     private static DeviceVersionSnapshot Snapshot(string serial) => new()
     {
         AdbSerial = serial,
+        DeviceSerial = serial,
         CollectedAt = DateTimeOffset.Now,
         Components =
         [
@@ -103,7 +151,13 @@ public sealed class SqliteProductionRepositoryTests : IAsyncLifetime
                 DisplayName = "手环",
                 Required = true,
                 State = QueryState.Success,
-                Values = new Dictionary<string, string> { ["left"] = "3.0.3.3", ["right"] = "3.0.3.2" }
+                Values = new Dictionary<string, string>
+                {
+                    ["leftSn"] = "LEFT-SN",
+                    ["leftVersion"] = "3.0.3.3",
+                    ["rightSn"] = "RIGHT-SN",
+                    ["rightVersion"] = "3.0.3.2"
+                }
             }
         ]
     };

@@ -24,6 +24,17 @@ public static class ConfigurationService
         return JsonSerializer.Deserialize<AppConfiguration>(json, JsonOptions) ?? new AppConfiguration();
     }
 
+    public static void Save(AppConfiguration configuration, string? path = null)
+    {
+        path ??= Path.Combine(AppContext.BaseDirectory, "appsettings.json");
+        var json = JsonSerializer.Serialize(configuration, new JsonSerializerOptions(JsonOptions)
+        {
+            PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+            WriteIndented = true
+        });
+        File.WriteAllText(path, json);
+    }
+
     public static string GetDataDirectory()
     {
         var directory = Path.Combine(

@@ -30,6 +30,7 @@ public sealed class VersionComponentResult
 public sealed class DeviceVersionSnapshot
 {
     public string AdbSerial { get; init; } = string.Empty;
+    public string DeviceSerial { get; init; } = string.Empty;
     public DateTimeOffset CollectedAt { get; init; }
     public IReadOnlyList<VersionComponentResult> Components { get; init; } = [];
 
