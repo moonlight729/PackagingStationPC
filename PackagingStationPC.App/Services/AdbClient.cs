@@ -43,7 +43,13 @@ public sealed class AdbClient
                 string.Equals(device.Serial, preferred, StringComparison.OrdinalIgnoreCase));
             if (selected is null)
             {
-                throw new InvalidOperationException($"未找到指定 ADB 设备 {preferred}。");
+                // 盒子的 ADB 序列号会随 USB 重新枚举变化，界面上的旧选择会因此失效，
+                // 只剩一个在线设备时直接改用它，避免整轮采集因“设备不存在”全部为空。
+                var onlyOnline = devices.Where(device => device.IsOnline).ToArray();
+                return onlyOnline.Length == 1
+                    ? onlyOnline[0]
+                    : throw new InvalidOperationException(
+                        $"未找到指定 ADB 设备 {preferred}，当前在线设备: {DescribeOnline(devices)}。");
             }
 
             if (!selected.IsOnline)
@@ -57,11 +63,24 @@ public sealed class AdbClient
         var online = devices.Where(device => device.IsOnline).ToArray();
         return online.Length switch
         {
-            0 => throw new InvalidOperationException("未检测到在线 ADB 设备。"),
+            0 => throw new InvalidOperationException(
+                devices.Count == 0
+                    ? "未检测到在线 ADB 设备。"
+                    : $"未检测到在线 ADB 设备，当前状态: {DescribeStates(devices)}。"),
             1 => online[0],
-            _ => throw new InvalidOperationException("检测到多台 ADB 设备，请先选择本工位设备。")
+            _ => throw new InvalidOperationException(
+                $"检测到多台 ADB 设备，请先选择本工位设备: {DescribeOnline(devices)}。")
         };
     }
+
+    private static string DescribeOnline(IReadOnlyList<AdbDeviceInfo> devices)
+    {
+        var online = devices.Where(device => device.IsOnline).Select(device => device.Serial).ToArray();
+        return online.Length == 0 ? "无" : string.Join(", ", online);
+    }
+
+    private static string DescribeStates(IReadOnlyList<AdbDeviceInfo> devices) =>
+        string.Join(", ", devices.Select(device => $"{device.Serial}({device.State})"));
 
     public Task<ProcessResult> ShellAsync(
         string serial,

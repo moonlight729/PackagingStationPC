@@ -41,7 +41,7 @@ public sealed class DeviceVersionService
             required: true);
         components.Add(box);
 
-        ProgressChanged?.Invoke("正在按 UART 协议查询眼镜版本（最多约 12 秒）...");
+        ProgressChanged?.Invoke("正在按 UART 协议查询眼镜版本（直接读写 ACM 串口）...");
         components.Add(await CaptureAsync(
             () => _glassesAcmService.QueryAsync(device.Serial, useSudo, cancellationToken),
             "glasses",

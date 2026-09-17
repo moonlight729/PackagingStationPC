@@ -1,9 +1,22 @@
+using System.Globalization;
 using System.Text;
 using System.Text.Json;
 using PackagingStationPC.Models;
 
 namespace PackagingStationPC.Services;
 
+/// <summary>
+/// 读取眼镜版本与 SN。
+///
+/// 眼镜的 YCTC UART v3 控制口 /dev/cam0_acm1 与盒子上的 camera10_node 共用，
+/// 直接用 busybox microcom 会有两个问题：
+/// 1) microcom 会占用 /var/lock/LCK..cam0_acm1 锁文件，adb 侧超时中断后远端进程不会退出，
+///    锁文件残留会让后续所有 microcom 都返回 “can't create ... File exists”，导致再也读不到版本；
+/// 2) microcom 不会拉 DTR/RTS，而眼镜板要求 DTR/RTS 有效。
+///
+/// 因此这里改为把一段小型 python 助手推到盒子上执行（与现场 ota-query-versions.sh 的做法一致）：
+/// 自己 open 串口 + termios 921600 8N1 + TIOCMSET 拉 DTR/RTS + tcflush 后发帧读帧并校验 CRC。
+/// </summary>
 public sealed class GlassesAcmService(AdbClient adbClient)
 {
     private const byte ProtocolVersion = 0x03;
@@ -12,27 +25,36 @@ public sealed class GlassesAcmService(AdbClient adbClient)
     private const byte SnData = 0xB6;
     private const byte SnStatus = 0xB7;
 
+    private const int Attempts = 2;
+    private const string PortMarker = "__ACM_PORT__=";
+    private const string ResponseMarker = "__ACM_RESP__=";
+    private const string HelperPath = "/tmp/.packaging-station-acm.py";
+
+    private static readonly TimeSpan ShellTimeout = TimeSpan.FromSeconds(20);
+    private static readonly string HelperBase64 =
+        Convert.ToBase64String(Encoding.UTF8.GetBytes(HelperSource));
+
     public async Task<VersionComponentResult> QueryAsync(
         string adbSerial,
         bool useSudo,
         CancellationToken cancellationToken = default)
     {
-        var versionPayload = await QueryWithRetryAsync(adbSerial, useSudo, UpdateVersion, [UpdateVersion], cancellationToken);
-        var snFrame = await QueryWithRetryAsync(adbSerial, useSudo, SnRead, [SnData, SnStatus], cancellationToken);
-        var values = ParseVersion(versionPayload.Payload);
-        values["sn"] = ParseSerialNumber(snFrame);
+        var version = await QueryFrameAsync(adbSerial, useSudo, UpdateVersion, [UpdateVersion], cancellationToken);
+        var sn = await QueryFrameAsync(adbSerial, useSudo, SnRead, [SnData, SnStatus], cancellationToken);
+        var values = ParseVersion(version.Payload);
+        values["sn"] = ParseSerialNumber(sn);
         return new VersionComponentResult
         {
             Component = "glasses",
             DisplayName = "眼镜",
             Required = true,
             State = QueryState.Success,
-            Source = $"ACM YCTC v3: {versionPayload.Port}",
+            Source = $"ACM YCTC v3: {version.Port}",
             Values = values
         };
     }
 
-    private async Task<AcmResponse> QueryWithRetryAsync(
+    private async Task<AcmResponse> QueryFrameAsync(
         string adbSerial,
         bool useSudo,
         byte requestType,
@@ -40,16 +62,16 @@ public sealed class GlassesAcmService(AdbClient adbClient)
         CancellationToken cancellationToken)
     {
         var errors = new List<string>();
-        for (var attempt = 1; attempt <= 8; attempt++)
+        for (var attempt = 1; attempt <= Attempts; attempt++)
         {
             try
             {
-                return await QueryAsync(adbSerial, useSudo, requestType, responseTypes, cancellationToken);
+                return await QueryOnceAsync(adbSerial, useSudo, requestType, responseTypes, cancellationToken);
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
-                errors.Add($"第 {attempt} 次: {ex.Message}");
-                if (attempt < 8)
+                errors.Add($"第 {attempt} 次: {Truncate(ex.Message, 200)}");
+                if (attempt < Attempts)
                 {
                     await Task.Delay(100, cancellationToken);
                 }
@@ -57,37 +79,7 @@ public sealed class GlassesAcmService(AdbClient adbClient)
         }
 
         throw new InvalidOperationException(
-            $"眼镜 ACM 0x{requestType:X2} 重试 8 次失败。{string.Join("; ", errors)}");
-    }
-
-    private async Task<AcmResponse> QueryAsync(
-        string adbSerial,
-        bool useSudo,
-        byte requestType,
-        byte[] responseTypes,
-        CancellationToken cancellationToken)
-    {
-        var errors = new List<string>();
-        for (var attempt = 1; attempt <= 8; attempt++)
-        {
-            try
-            {
-                return await QueryOnceAsync(
-                    adbSerial,
-                    useSudo,
-                    requestType,
-                    responseTypes,
-                    (ushort)attempt,
-                    cancellationToken);
-            }
-            catch (Exception ex) when (ex is not OperationCanceledException)
-            {
-                errors.Add($"第 {attempt} 次: {ex.Message}");
-            }
-        }
-
-        throw new InvalidOperationException(
-            $"眼镜 ACM 0x{requestType:X2} 重试 8 次失败。{string.Join("; ", errors)}");
+            $"眼镜 ACM 0x{requestType:X2} 重试 {Attempts} 次失败。{string.Join("; ", errors)}");
     }
 
     private async Task<AcmResponse> QueryOnceAsync(
@@ -95,57 +87,118 @@ public sealed class GlassesAcmService(AdbClient adbClient)
         bool useSudo,
         byte requestType,
         byte[] responseTypes,
-        ushort sequence,
         CancellationToken cancellationToken)
     {
-        var frame = BuildFrame(requestType, sequence);
-        var encoded = Convert.ToBase64String(frame);
+        var frameHex = Convert.ToHexString(BuildFrame(requestType, 1));
+        var expected = string.Join(',', responseTypes.Select(type => type.ToString("X2", CultureInfo.InvariantCulture)));
         var privilege = useSudo ? "sudo -n " : string.Empty;
-        var script = $"port=/dev/cam0_acm1; [ -e \"$port\" ] || port=/dev/ttyACM1; " +
-                     "[ -e \"$port\" ] || { echo ACM_PORT_NOT_FOUND >&2; exit 2; }; " +
-                     "echo __ACM_PORT__=$port; printf '__ACM_DATA__='; " +
-                     $"printf '%s' '{encoded}' | base64 -d | {privilege}busybox microcom -X -t 2000 -s 921600 \"$port\" | " +
-                     "base64 | tr -d '\\r\\n'; echo";
-        var result = await adbClient.ShellAsync(
-            adbSerial,
-            script,
-            TimeSpan.FromSeconds(6),
-            cancellationToken);
+        // 设备侧脚本：定位串口 -> 清掉上次遗留的 microcom 锁与进程 -> 落地 python 助手 -> 执行 -> 清理。
+        // pkill 的模式写成 [b]usybox microcom，避免匹配到本脚本自身的命令行。
+        var script =
+            "port=; for p in /dev/cam0_acm1 /dev/ttyACM1; do [ -e $p ] && { port=$p; break; }; done; " +
+            "[ -n $port ] || { echo ACM_PORT_NOT_FOUND >&2; exit 2; }; " +
+            "command -v python3 >/dev/null 2>&1 || { echo ACM_PYTHON_MISSING >&2; exit 3; }; " +
+            "rm -f /var/lock/LCK..$(basename $port); " +
+            "pkill -f '[b]usybox microcom' >/dev/null 2>&1; " +
+            $"echo {PortMarker}$port; " +
+            $"printf '%s' '{HelperBase64}' | base64 -d > {HelperPath}; " +
+            $"{privilege}python3 {HelperPath} $port '{expected}' {frameHex}; rc=$?; " +
+            $"rm -f {HelperPath}; echo __ACM_RC__=$rc; exit $rc";
+        var result = await adbClient.ShellAsync(adbSerial, script, ShellTimeout, cancellationToken);
         if (!result.Success)
         {
-            var detail = string.IsNullOrWhiteSpace(result.StandardError)
-                ? result.StandardOutput
-                : result.StandardError;
             throw new InvalidOperationException(
-                $"眼镜 ACM 0x{requestType:X2} 查询失败(exit={result.ExitCode}, timeout={result.TimedOut}): {detail.Trim()}");
+                $"眼镜 ACM 0x{requestType:X2} 查询失败(exit={result.ExitCode}, timeout={result.TimedOut}): {Describe(result)}");
         }
 
         var lines = result.StandardOutput.Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries);
-        var port = lines.LastOrDefault(line => line.StartsWith("__ACM_PORT__=", StringComparison.Ordinal))?
-            .Substring("__ACM_PORT__=".Length).Trim() ?? "unknown";
-        foreach (var line in lines.Reverse())
+        var port = "unknown";
+        AcmResponse? response = null;
+        foreach (var line in lines)
         {
-            if (!line.StartsWith("__ACM_DATA__=", StringComparison.Ordinal))
+            var portIndex = line.IndexOf(PortMarker, StringComparison.Ordinal);
+            if (portIndex >= 0)
             {
-                continue;
+                port = line[(portIndex + PortMarker.Length)..].Trim()
+                    .Split([' ', '\t'], StringSplitOptions.RemoveEmptyEntries)
+                    .FirstOrDefault() ?? "unknown";
             }
 
-            try
+            var responseIndex = line.IndexOf(ResponseMarker, StringComparison.Ordinal);
+            if (responseIndex >= 0 &&
+                TryParseResponse(line[(responseIndex + ResponseMarker.Length)..], out var parsed))
             {
-                var bytes = Convert.FromBase64String(line.Substring("__ACM_DATA__=".Length).Trim());
-                var parsed = FindFrame(bytes, responseTypes);
-                if (parsed is not null)
-                {
-                    return parsed with { Port = port };
-                }
-            }
-            catch (FormatException)
-            {
+                response = parsed;
             }
         }
 
-        throw new InvalidOperationException($"眼镜 ACM 0x{requestType:X2} 未返回有效响应帧。");
+        return response is null
+            ? throw new InvalidOperationException(
+                $"眼镜 ACM 0x{requestType:X2} 未返回有效响应帧（{Describe(result)}）。")
+            : response with { Port = port };
     }
+
+    private static string Describe(ProcessResult result)
+    {
+        var probe = result.StandardError + "\n" + result.StandardOutput;
+        if (probe.Contains("ACM_PORT_NOT_FOUND", StringComparison.Ordinal))
+        {
+            return "盒子上不存在 /dev/cam0_acm1 与 /dev/ttyACM1，眼镜可能未接入盒子";
+        }
+
+        if (probe.Contains("ACM_PYTHON_MISSING", StringComparison.Ordinal))
+        {
+            return "盒子上未安装 python3，无法查询眼镜版本";
+        }
+
+        var detail = string.IsNullOrWhiteSpace(result.StandardError)
+            ? result.StandardOutput
+            : result.StandardError;
+        var tail = string.Join(
+            ' ',
+            detail.Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                .TakeLast(3));
+        return tail.Length == 0 ? "无输出" : Truncate(tail, 200);
+    }
+
+    private static bool TryParseResponse(string text, out AcmResponse response)
+    {
+        response = null!;
+        var separator = text.IndexOf(':');
+        if (separator <= 0 ||
+            !byte.TryParse(text[..separator], NumberStyles.HexNumber, CultureInfo.InvariantCulture, out var type))
+        {
+            return false;
+        }
+
+        var hexLength = 0;
+        while (hexLength < text.Length - separator - 1 && IsHexDigit(text[separator + 1 + hexLength]))
+        {
+            hexLength++;
+        }
+
+        hexLength -= hexLength % 2;
+        if (hexLength == 0)
+        {
+            return false;
+        }
+
+        try
+        {
+            response = new AcmResponse(type, Convert.FromHexString(text.Substring(separator + 1, hexLength)), string.Empty);
+            return true;
+        }
+        catch (FormatException)
+        {
+            return false;
+        }
+    }
+
+    private static bool IsHexDigit(char value) =>
+        (value >= '0' && value <= '9') || (value >= 'a' && value <= 'f') || (value >= 'A' && value <= 'F');
+
+    private static string Truncate(string value, int maxLength) =>
+        value.Length <= maxLength ? value : value[..maxLength] + "…";
 
     private static byte[] BuildFrame(byte type, ushort sequence)
     {
@@ -159,37 +212,6 @@ public sealed class GlassesAcmService(AdbClient adbClient)
         var crc = Crc16(frame.AsSpan(0, 10));
         BitConverter.TryWriteBytes(frame.AsSpan(10, 2), crc);
         return frame;
-    }
-
-    private static AcmResponse? FindFrame(byte[] buffer, byte[] expectedTypes)
-    {
-        for (var offset = 0; offset <= buffer.Length - 12; offset++)
-        {
-            if (buffer[offset] != 0x53 || buffer[offset + 1] != 0x59 || buffer[offset + 2] != ProtocolVersion)
-            {
-                continue;
-            }
-
-            var payloadLength = BitConverter.ToUInt16(buffer, offset + 7);
-            var frameLength = 12 + payloadLength;
-            if (offset + frameLength > buffer.Length || !expectedTypes.Contains(buffer[offset + 3]))
-            {
-                continue;
-            }
-
-            var expectedCrc = BitConverter.ToUInt16(buffer, offset + 10 + payloadLength);
-            if (Crc16(buffer.AsSpan(offset, 10 + payloadLength)) != expectedCrc)
-            {
-                continue;
-            }
-
-            return new AcmResponse(
-                buffer[offset + 3],
-                buffer.AsSpan(offset + 10, payloadLength).ToArray(),
-                string.Empty);
-        }
-
-        return null;
     }
 
     private static Dictionary<string, string> ParseVersion(byte[] payload)
@@ -238,4 +260,89 @@ public sealed class GlassesAcmService(AdbClient adbClient)
     }
 
     private sealed record AcmResponse(byte Type, byte[] Payload, string Port);
+
+    /// <summary>
+    /// 在盒子上执行的 python 助手：直接打开 ACM 串口（termios 921600 8N1 + DTR/RTS），
+    /// 写请求帧并最多做 8 轮读取（每轮 1.5 秒），命中期望类型且 CRC 正确的帧时打印
+    /// <c>__ACM_RESP__=&lt;类型&gt;:&lt;payload hex&gt;</c> 并以 0 退出。
+    /// 参数：argv[1]=串口，argv[2]=期望响应类型（逗号分隔 hex），argv[3]=请求帧（hex）。
+    /// </summary>
+    private const string HelperSource = """
+        import fcntl, os, select, struct, sys, termios, time
+
+        TIOCMSET = 0x5402
+        TIOCM_DTR = 0x002
+        TIOCM_RTS = 0x004
+        MAGIC = b'\x53\x59'
+        VER = 0x03
+        TIMEOUT = 1.5
+        ROUNDS = 8
+        MARKER = '__ACM_RESP__='
+
+
+        def crc16(data):
+            crc = 0xFFFF
+            for value in data:
+                crc ^= value
+                for _ in range(8):
+                    crc = (crc >> 1) ^ 0xA001 if crc & 1 else crc >> 1
+            return crc
+
+
+        def pick(buf, wanted):
+            index = buf.find(MAGIC)
+            while index >= 0 and len(buf) - index >= 12:
+                frame = buf[index:]
+                if frame[2] == VER and frame[3] in wanted and frame[9] == 0:
+                    length = int.from_bytes(frame[7:9], 'little')
+                    if len(frame) >= 12 + length and crc16(frame[:10 + length]) == int.from_bytes(frame[10 + length:12 + length], 'little'):
+                        return frame[3], frame[10:10 + length]
+                index = buf.find(MAGIC, index + 1)
+            return None
+
+
+        def main(port, wanted, request):
+            fd = os.open(port, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+            try:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                except OSError:
+                    pass
+                attrs = termios.tcgetattr(fd)
+                attrs[0] = attrs[1] = attrs[3] = 0
+                attrs[2] = termios.CS8 | termios.CLOCAL | termios.CREAD
+                attrs[4] = attrs[5] = termios.B921600
+                attrs[6][termios.VMIN] = attrs[6][termios.VTIME] = 0
+                termios.tcsetattr(fd, termios.TCSANOW, attrs)
+                fcntl.ioctl(fd, TIOCMSET, struct.pack('I', TIOCM_DTR | TIOCM_RTS))
+                for attempt in range(1, ROUNDS + 1):
+                    frame = bytearray(request)
+                    frame[5] = attempt & 0xFF
+                    frame[6] = (attempt >> 8) & 0xFF
+                    frame[10] = frame[11] = 0
+                    crc = crc16(bytes(frame[:10]))
+                    frame[10] = crc & 0xFF
+                    frame[11] = (crc >> 8) & 0xFF
+                    termios.tcflush(fd, termios.TCIFLUSH)
+                    os.write(fd, bytes(frame))
+                    deadline = time.time() + TIMEOUT
+                    buf = b''
+                    while time.time() < deadline:
+                        ready, _, _ = select.select([fd], [], [], 0.2)
+                        if ready:
+                            try:
+                                buf += os.read(fd, 4096)
+                            except BlockingIOError:
+                                continue
+                        hit = pick(buf, wanted)
+                        if hit is not None:
+                            print(MARKER + '%02X:' % hit[0] + hit[1].hex())
+                            return 0
+                return 1
+            finally:
+                os.close(fd)
+
+
+        sys.exit(main(sys.argv[1], set(int(x, 16) for x in sys.argv[2].split(',')), bytes.fromhex(sys.argv[3])))
+        """;
 }

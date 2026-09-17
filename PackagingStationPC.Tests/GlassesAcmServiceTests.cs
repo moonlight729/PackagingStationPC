@@ -7,11 +7,11 @@ namespace PackagingStationPC.Tests;
 public sealed class GlassesAcmServiceTests
 {
     [Fact]
-    public async Task Query_ParsesVersionAndSerialUsingCSharpProtocolImplementation()
+    public async Task Query_ParsesVersionAndSerialFromOnDeviceAcmHelper()
     {
         var runner = new QueueProcessRunner(
-            AcmOutput(0xA4, Encoding.UTF8.GetBytes("{\"app\":\"V1.2.3\"}")),
-            AcmOutput(0xB6, [0x01, 0x06, .. Encoding.UTF8.GetBytes("GLS123")]));
+            Success(AcmOutput(0xA4, Encoding.UTF8.GetBytes("{\"app\":\"V1.2.3\"}"))),
+            Success(AcmOutput(0xB6, [0x01, 0x06, .. Encoding.UTF8.GetBytes("GLS123")])));
         var adb = new AdbClient(new AdbConfiguration { Path = "adb" }, runner);
 
         var result = await new GlassesAcmService(adb).QueryAsync("adb-001", useSudo: false);
@@ -20,42 +20,39 @@ public sealed class GlassesAcmServiceTests
         Assert.Equal("V1.2.3", result.Values["app"]);
         Assert.Equal("GLS123", result.Values["sn"]);
         Assert.Contains("/dev/cam0_acm1", result.Source);
-        Assert.All(runner.Commands, command => Assert.DoesNotContain("python", command, StringComparison.OrdinalIgnoreCase));
-        Assert.Contains(runner.Commands, command => command.Contains("U1kDpA", StringComparison.Ordinal));
-        Assert.Contains(runner.Commands, command => command.Contains("U1kDtQ", StringComparison.Ordinal));
+        Assert.All(runner.Commands, command => Assert.DoesNotContain("busybox microcom -X", command, StringComparison.Ordinal));
+        Assert.All(runner.Commands, command => Assert.Contains("python3", command, StringComparison.Ordinal));
+        Assert.All(runner.Commands, command => Assert.Contains("rm -f /var/lock/LCK..", command, StringComparison.Ordinal));
+        Assert.Contains(runner.Commands, command => command.Contains("535903A4", StringComparison.Ordinal));
+        Assert.Contains(runner.Commands, command => command.Contains("535903B5", StringComparison.Ordinal));
     }
 
-    private static string AcmOutput(byte type, byte[] payload)
+    [Fact]
+    public async Task Query_ExplainsMissingPortInsteadOfRawExitCode()
     {
-        var frame = new byte[12 + payload.Length];
-        frame[0] = 0x53;
-        frame[1] = 0x59;
-        frame[2] = 0x03;
-        frame[3] = type;
-        BitConverter.TryWriteBytes(frame.AsSpan(7, 2), (ushort)payload.Length);
-        payload.CopyTo(frame, 10);
-        BitConverter.TryWriteBytes(frame.AsSpan(10 + payload.Length, 2), Crc16(frame.AsSpan(0, 10 + payload.Length)));
-        return $"shell noise\n__ACM_PORT__=/dev/cam0_acm1\n__ACM_DATA__={Convert.ToBase64String(frame)}\n";
+        var runner = new QueueProcessRunner(
+            Failure(2, "ACM_PORT_NOT_FOUND"),
+            Failure(2, "ACM_PORT_NOT_FOUND"));
+        var adb = new AdbClient(new AdbConfiguration { Path = "adb" }, runner);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => new GlassesAcmService(adb).QueryAsync("adb-001", useSudo: false));
+
+        Assert.Contains("未接入盒子", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("ACM 0xA4", exception.Message, StringComparison.Ordinal);
     }
 
-    private static ushort Crc16(ReadOnlySpan<byte> data)
-    {
-        ushort crc = 0xFFFF;
-        foreach (var value in data)
-        {
-            crc ^= value;
-            for (var bit = 0; bit < 8; bit++)
-            {
-                crc = (ushort)((crc & 1) != 0 ? (crc >> 1) ^ 0xA001 : crc >> 1);
-            }
-        }
+    private static string AcmOutput(byte type, byte[] payload) =>
+        $"resize: Terminal is not VT100-compatible\n__ACM_PORT__=/dev/cam0_acm1\n" +
+        $"__ACM_RESP__={type:X2}:{Convert.ToHexString(payload)}\n__ACM_RC__=0\n";
 
-        return crc;
-    }
+    private static ProcessResult Success(string stdout) => new(0, stdout, string.Empty, false);
 
-    private sealed class QueueProcessRunner(params string[] outputs) : IProcessRunner
+    private static ProcessResult Failure(int exitCode, string stderr) => new(exitCode, string.Empty, stderr, false);
+
+    private sealed class QueueProcessRunner(params ProcessResult[] results) : IProcessRunner
     {
-        private readonly Queue<string> _outputs = new(outputs);
+        private readonly Queue<ProcessResult> _results = new(results);
         public List<string> Commands { get; } = [];
 
         public Task<ProcessResult> RunAsync(
@@ -66,7 +63,9 @@ public sealed class GlassesAcmServiceTests
         {
             var values = arguments.ToArray();
             Commands.Add(values[^1]);
-            return Task.FromResult(new ProcessResult(0, _outputs.Dequeue(), string.Empty, false));
+            return Task.FromResult(_results.Count > 0
+                ? _results.Dequeue()
+                : new ProcessResult(0, string.Empty, string.Empty, false));
         }
     }
 }
