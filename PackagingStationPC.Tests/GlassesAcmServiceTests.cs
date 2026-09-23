@@ -10,8 +10,9 @@ public sealed class GlassesAcmServiceTests
     [Fact]
     public async Task Query_ParsesVersionAndSerialFromOnDeviceAcmHelper()
     {
-        // 版本帧与 SN 帧合并为一次 adb shell，助手只打印一次结果。
+        // 两条命令：先把助手写到盒子上，再一次跑完版本帧与 SN 帧。
         var runner = new QueueProcessRunner(
+            Success(ReadyOutput),
             Success(AcmOutput(
                 (0, 0xA4, Encoding.UTF8.GetBytes("{\"app\":\"V1.2.3\"}")),
                 (1, 0xB6, [0x01, 0x06, .. Encoding.UTF8.GetBytes("GLS123")]))));
@@ -23,18 +24,28 @@ public sealed class GlassesAcmServiceTests
         Assert.Equal("V1.2.3", result.Values["app"]);
         Assert.Equal("GLS123", result.Values["sn"]);
         Assert.Contains("/dev/cam0_acm1", result.Source);
-        Assert.Single(runner.Commands);
-        Assert.All(runner.Commands, command => Assert.DoesNotContain("busybox microcom -X", command, StringComparison.Ordinal));
-        Assert.All(runner.Commands, command => Assert.Contains("python3", command, StringComparison.Ordinal));
-        Assert.All(runner.Commands, command => Assert.Contains("rm -f /var/lock/LCK..", command, StringComparison.Ordinal));
-        Assert.Contains(runner.Commands, command => command.Contains("535903A4", StringComparison.Ordinal));
-        Assert.Contains(runner.Commands, command => command.Contains("535903B5", StringComparison.Ordinal));
+
+        // 助手写入命令与执行命令分开，避免单条 adb shell 命令过长。
+        Assert.Equal(2, runner.Commands.Count);
+        Assert.Contains("base64 -d", runner.Commands[0], StringComparison.Ordinal);
+        Assert.DoesNotContain("python3", runner.Commands[0], StringComparison.Ordinal);
+
+        var run = runner.Commands[1];
+        Assert.DoesNotContain("busybox microcom -X", run, StringComparison.Ordinal);
+        Assert.Contains("python3", run, StringComparison.Ordinal);
+        Assert.Contains("rm -f /var/lock/LCK..", run, StringComparison.Ordinal);
+        Assert.Contains("535903A4", run, StringComparison.Ordinal);
+        Assert.Contains("535903B5", run, StringComparison.Ordinal);
     }
 
     [Fact]
     public async Task Query_ExplainsMissingPortInsteadOfRawExitCode()
     {
-        var runner = new QueueProcessRunner(Failure(2, "ACM_PORT_NOT_FOUND"));
+        var runner = new QueueProcessRunner(
+            Success(ReadyOutput),
+            Failure(2, "ACM_PORT_NOT_FOUND"),
+            Success(ReadyOutput),
+            Failure(2, "ACM_PORT_NOT_FOUND"));
         var adb = new AdbClient(new AdbConfiguration { Path = "adb" }, runner);
 
         var exception = await Assert.ThrowsAsync<InvalidOperationException>(
@@ -43,6 +54,8 @@ public sealed class GlassesAcmServiceTests
         Assert.Contains("未接入盒子", exception.Message, StringComparison.Ordinal);
         Assert.Contains("ACM 0xA4", exception.Message, StringComparison.Ordinal);
     }
+
+    private const string ReadyOutput = "__ACM_RDY__=0";
 
     private static string AcmOutput(params (int Index, byte Type, byte[] Payload)[] responses)
     {

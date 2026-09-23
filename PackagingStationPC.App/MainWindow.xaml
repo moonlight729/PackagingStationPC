@@ -181,9 +181,20 @@
                 <Grid.ColumnDefinitions>
                     <ColumnDefinition Width="*" />
                     <ColumnDefinition Width="Auto" />
+                    <ColumnDefinition Width="Auto" />
                 </Grid.ColumnDefinitions>
                 <TextBlock Text="{Binding StatusMessage}" VerticalAlignment="Center" TextTrimming="CharacterEllipsis" />
-                <TextBlock Grid.Column="1" Text="{Binding UploadMode, StringFormat=上传: {0}}" VerticalAlignment="Center" Margin="18,0" Foreground="{StaticResource MutedTextBrush}" />
+                <TextBlock Grid.Column="1"
+                           Text="{Binding AppVersionDisplay, StringFormat=版本: {0}}"
+                           VerticalAlignment="Center"
+                           Margin="18,0"
+                           Foreground="{StaticResource MutedTextBrush}"
+                           FontFamily="Consolas">
+                    <TextBlock.ToolTip>
+                        <TextBlock Text="{Binding AppVersionDetail}" TextWrapping="Wrap" MaxWidth="420" />
+                    </TextBlock.ToolTip>
+                </TextBlock>
+                <TextBlock Grid.Column="2" Text="{Binding UploadMode, StringFormat=上传: {0}}" VerticalAlignment="Center" Margin="18,0" Foreground="{StaticResource MutedTextBrush}" />
             </Grid>
         </Border>
     </Grid>

@@ -80,6 +80,8 @@ public sealed class MainViewModel : ObservableObject
     public string ProductName => _configuration.Sn.ProductName;
     public string StationCode => _configuration.StationCode;
     public string UploadMode => _uploadService.Mode;
+    public string AppVersionDisplay => BuildVersion.Display;
+    public string AppVersionDetail => BuildVersion.Detail;
     public string UploadEndpoint =>
         _configuration.FactorySystem.BaseUrl.TrimEnd('/') + "/" +
         _configuration.FactorySystem.CreateRoutePath.TrimStart('/');
@@ -364,11 +366,17 @@ public sealed class MainViewModel : ObservableObject
     {
         var missing = new List<string>();
         var box = snapshot.Components.FirstOrDefault(item => item.Component == "box");
-        Require(box, "盒子", "sn", "uboot", "kernel", "rootfs");
+        Require(box, "盒子", "sn", "uboot", "kernel", "rootfs", "gen1App");
         var glasses = snapshot.Components.FirstOrDefault(item => item.Component == "glasses");
         Require(glasses, "眼镜", "sn", "uboot", "kernel", "rootfs", "app");
         var band = snapshot.Components.FirstOrDefault(item => item.Component == "band");
         Require(band, "手环", "leftSn", "rightSn");
+        // 左右手环必须各一只且不是同一只，否则不允许上报版本信息。
+        if (band is not null && !IsBandPairValid(band))
+        {
+            missing.Add("手环.左右手环配对");
+        }
+
         return missing.Count == 0 ? null : string.Join("、", missing);
 
         void Require(VersionComponentResult? component, string displayName, params string[] fields)
@@ -443,8 +451,25 @@ public sealed class MainViewModel : ObservableObject
                 component.State is QueryState.Success ? "INFO" : "ERROR",
                 $"Version component={component.Component}, state={component.State}, values={values}, source={component.Source}, message={component.Message}");
         }
-        await _logger.WriteAsync("INFO", $"Version query device={_snapshot.AdbSerial}, complete={_snapshot.IsComplete}");
+        await _logger.WriteAsync(
+            "INFO",
+            $"Version query device={_snapshot.AdbSerial}, complete={_snapshot.IsComplete}, app={BuildVersion.Display}");
         RaiseCommandStates();
+    }
+
+    /// <summary>
+    /// 左右手环配对是否可用于上报：读取未失败、左右 SN 都非空、且左右不是同一只手环。
+    /// </summary>
+    internal static bool IsBandPairValid(VersionComponentResult band)
+    {
+        if (band.State is QueryState.Failed ||
+            !band.Values.TryGetValue("leftSn", out var leftSn) || string.IsNullOrWhiteSpace(leftSn) ||
+            !band.Values.TryGetValue("rightSn", out var rightSn) || string.IsNullOrWhiteSpace(rightSn))
+        {
+            return false;
+        }
+
+        return !string.Equals(leftSn.Trim(), rightSn.Trim(), StringComparison.OrdinalIgnoreCase);
     }
 
     private static string DisplayComponent(VersionComponentResult component, string field) => field switch
@@ -462,6 +487,7 @@ public sealed class MainViewModel : ObservableObject
         "kernel" => "Kernel 版本",
         "rootfs" => "RootFS 版本",
         "app" => "应用版本",
+        "gen1App" => "Gen1-APP 版本",
         _ => field
     };
 
@@ -490,6 +516,14 @@ public sealed class MainViewModel : ObservableObject
         if (_configuration.Adb.RequireCompleteVersionSet && !_snapshot.IsComplete)
         {
             throw new InvalidOperationException("必需版本项不完整，不能预留 SN。");
+        }
+
+        // 左右手环配对是硬约束，不受 requireCompleteVersionSet 开关影响。
+        var band = _snapshot.Components.FirstOrDefault(item => item.Component == "band");
+        if (band is not null && !IsBandPairValid(band))
+        {
+            throw new InvalidOperationException(
+                $"手环不是一左一右两只不同的手环（{band.Message}），不能预留 SN，请检查手环连接后重新扫描。");
         }
 
         var reservation = await _repository.ReserveAsync(
@@ -544,9 +578,22 @@ public sealed class MainViewModel : ObservableObject
         }
     }
 
-    private bool CanReserveSn() =>
-        !IsBusy && CurrentRecord is null && _snapshot is not null &&
-        (!_configuration.Adb.RequireCompleteVersionSet || _snapshot.IsComplete);
+    private bool CanReserveSn()
+    {
+        if (IsBusy || CurrentRecord is not null || _snapshot is null)
+        {
+            return false;
+        }
+
+        if (_configuration.Adb.RequireCompleteVersionSet && !_snapshot.IsComplete)
+        {
+            return false;
+        }
+
+        // 左右手环必须是一左一右两只不同的手环才允许预留 SN。
+        var band = _snapshot.Components.FirstOrDefault(item => item.Component == "band");
+        return band is null || IsBandPairValid(band);
+    }
 
     private bool CanMoveNext() => !IsBusy && CurrentRecord is not null;
 

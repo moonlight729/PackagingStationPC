@@ -112,6 +112,21 @@ dotnet test .\PackagingStationPC.slnx -c Debug --no-restore
 .\PackagingStationPC.App\bin\Debug\net10.0-windows\PackagingStationPC.exe
 ```
 
+### 3.4 程序版本号
+
+编译时由 `GenerateBuildVersionFile` 目标执行 `git describe`（tags/always/dirty/long），
+把 `tag + 距 tag 提交数 + 短 commit + 是否 dirty` 写入 `BuildVersionInfo.Describe`，
+再由 `BuildVersion` / `GitVersionDescription` 解析。界面底部状态栏显示：
+
+```text
+版本: V1.0.0+1 (393da69-dirty)
+```
+
+鼠标悬停可看到完整的 tag、commit、距 tag 提交数和工作区状态；版本同时写入每次版本采集日志，
+便于追溯现场运行的程序来自哪个 tag/commit。git 不可用或仓库无提交时显示“未知版本”。
+
+发布前打 tag（`git tag V1.0.0`）后重新编译，版本号即为该 tag。
+
 ## 4. 整体生产流程
 
 ```text
@@ -173,7 +188,23 @@ kernel version: v0.1.1-260903.050734-436e50b1d
 rootfs version: 0.0.5
 ```
 
-采集字段：`box.sn`、`box.uboot`、`box.kernel`、`box.rootfs`。ADB transport serial 只用于选择连接，不作为产品 SN。
+再读取盒子上 Gen1-APP（`gen1-app.service` 对应的 deb 包）的版本：
+
+```sh
+dpkg-query -W gen1-app
+```
+
+期望输出：
+
+```text
+gen1-app	0.5.0-20260920-36.3dc2a236
+```
+
+采集字段：`box.sn`、`box.uboot`、`box.kernel`、`box.rootfs`、`box.gen1App`。ADB transport serial 只用于选择连接，不作为产品 SN。
+
+三条命令合并在同一条 shell 中执行（SN 需要 root 或 `sudo -n`，`dpkg-query` 只查包数据库不需要 root），
+用 `__BOX_SN_RC__`、`__BOX_VER_RC__`、`__BOX_APP_RC__` 三个标记行分段并带回各自退出码，
+避免多次 adb 往返。其中任一条失败都视为盒子采集失败。`Gen1-APP` 未安装时 `dpkg-query` 退出码非 0。
 
 ### 5.2 眼镜
 
@@ -249,15 +280,23 @@ band.rightVersion
 
 左右手环 SN 必须读取。当前兼容部分固件不支持 `version` 命令的情况：版本读取失败时保存空字符串并在界面显示“未获取”，但不单独阻止上报。
 
+左右配对是硬约束，必须满足“有且仅有一只左手环 + 有且仅有一只右手环，且两者 SN 不同”，左右归属只认 `hand` 命令返回值，不按 COM 号判断。以下情况判为不合法，手环组件置为 `Failed` 并清空左右 SN：
+
+- 任一侧未读到 SN；
+- 任一侧检测到多只同侧手环（例如两只左手环）；
+- 左右 SN 相同（同一只手环被当成左右两只）。
+
 ## 6. 上报门禁
 
 扫码自动流程在写数据库和访问 MES 之前执行字段校验：
 
 | 组件 | 必需字段 |
 |---|---|
-| 盒子 | `sn`、`uboot`、`kernel`、`rootfs` |
+| 盒子 | `sn`、`uboot`、`kernel`、`rootfs`、`gen1App` |
 | 眼镜 | `sn`、`uboot`、`kernel`、`rootfs`、`app` |
 | 手环 | `leftSn`、`rightSn` |
+
+此外，手环还必须通过左右配对校验（一左一右、SN 互不相同），该校验不受 `requireCompleteVersionSet` 开关影响，失败时同样禁止预留 SN 与上报。
 
 任何必需字段为空时：
 

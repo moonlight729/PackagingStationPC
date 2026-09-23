@@ -29,10 +29,16 @@ public sealed class GlassesAcmService(AdbClient adbClient)
     private const string PortMarker = "__ACM_PORT__=";
     private const string ResponseMarker = "__ACM_RESP__=";
     private const string MissingMarker = "__ACM_MISS__=";
-    private const string HelperPath = "/tmp/.packaging-station-acm.py";
+    private const string ReadyMarker = "__ACM_RDY__=";
+    private const string HelperPath = "/tmp/.psacm.py";
 
-    // 板上 python 助手一轮最多 ROUNDS×TIMEOUT，两帧合计约 8s，留足余量即可。
-    private static readonly TimeSpan ShellTimeout = TimeSpan.FromSeconds(12);
+    // adb shell 单条命令有长度上限（超限会直接报 "shell command too long"）：
+    // 助手脚本的 base64 已接近上限，再叠加多帧参数就会超限，因此拆成"推助手"和"跑助手"两条命令；
+    // 助手继续变大时按 4 的倍数分片写入，保证每片都能独立 base64 解码。
+    private const int MaxBase64PerCommand = 3848;
+
+    // 板上 python 助手最多 ROUNDS×TIMEOUT，两帧合计约 24s，留足余量。
+    private static readonly TimeSpan ShellTimeout = TimeSpan.FromSeconds(26);
     private static readonly TimeSpan RetryDelay = TimeSpan.FromMilliseconds(150);
     private static readonly string HelperBase64 =
         Convert.ToBase64String(Encoding.UTF8.GetBytes(HelperSource));
@@ -96,6 +102,40 @@ public sealed class GlassesAcmService(AdbClient adbClient)
             $"眼镜 ACM {commands} 重试 {Attempts} 次失败。{string.Join("; ", errors)}");
     }
 
+    /// <summary>
+    /// 把 python 助手写到盒子上。单独一条命令，避免与帧参数挤在一起触发 adb "shell command too long"。
+    /// </summary>
+    private async Task DeployHelperAsync(string adbSerial, CancellationToken cancellationToken)
+    {
+        var pieces = new List<string>();
+        var offset = 0;
+        while (offset < HelperBase64.Length)
+        {
+            var length = Math.Min(MaxBase64PerCommand, HelperBase64.Length - offset);
+            length -= length % 4;
+            if (length <= 0)
+            {
+                length = HelperBase64.Length - offset;
+            }
+
+            pieces.Add(HelperBase64.Substring(offset, length));
+            offset += length;
+        }
+
+        for (var index = 0; index < pieces.Count; index++)
+        {
+            var redirect = index == 0 ? ">" : ">>";
+            var script = $"printf '%s' '{pieces[index]}' | base64 -d {redirect} {HelperPath}; rc=$?; echo {ReadyMarker}$rc";
+            var result = await adbClient.ShellAsync(adbSerial, script, cancellationToken);
+            if (!result.Success || !result.StandardOutput.Contains($"{ReadyMarker}0", StringComparison.Ordinal))
+            {
+                throw new InvalidOperationException(
+                    $"眼镜 ACM 助手写入失败(分片 {index + 1}/{pieces.Count}, exit={result.ExitCode}, " +
+                    $"timeout={result.TimedOut}): {Tail(result)}");
+            }
+        }
+    }
+
     private async Task<IReadOnlyList<AcmResponse>> QueryOnceAsync(
         string adbSerial,
         (byte Request, byte[] Expected)[] requests,
@@ -111,19 +151,21 @@ public sealed class GlassesAcmService(AdbClient adbClient)
             arguments.Add(Convert.ToHexString(BuildFrame(request.Request, 1)));
         }
 
+        await DeployHelperAsync(adbSerial, cancellationToken);
+
         // 权限在脚本内自判（root 直接跑，非 root 走 sudo -n），省掉一次额外的 adb shell 探测。
         var invocation = $"python3 {HelperPath} $port {string.Join(' ', arguments.Select(item => $"'{item}'"))}";
-        // 设备侧脚本：定位串口 -> 清掉上次遗留的 microcom 锁与进程 -> 落地 python 助手 -> 执行 -> 清理。
+        // 设备侧脚本：定位串口 -> 清掉上次遗留的 microcom 锁与进程 -> 执行助手（一次跑完多帧）-> 清理。
         // pkill 的模式写成 [b]usybox microcom，避免匹配到本脚本自身的命令行。
         var script =
             "port=; for p in /dev/cam0_acm1 /dev/ttyACM1; do [ -e $p ] && { port=$p; break; }; done; " +
             "[ -n $port ] || { echo ACM_PORT_NOT_FOUND >&2; exit 2; }; " +
             "command -v python3 >/dev/null 2>&1 || { echo ACM_PYTHON_MISSING >&2; exit 3; }; " +
+            $"[ -s {HelperPath} ] || {{ echo ACM_HELPER_MISSING >&2; exit 4; }}; " +
             "rm -f /var/lock/LCK..$(basename $port); " +
             "pkill -f '[b]usybox microcom' >/dev/null 2>&1; " +
             $"echo {PortMarker}$port; " +
-            $"printf '%s' '{HelperBase64}' | base64 -d > {HelperPath}; " +
-            $"if [ \"$(id -u)\" = \"0\" ]; then {invocation}; else sudo -n {invocation}; fi; rc=$?; " +
+            $"[ 0 = \"$(id -u)\" ] || P=\"sudo -n \"; $P {invocation}; rc=$?; " +
             $"rm -f {HelperPath}; echo __ACM_RC__=$rc; exit $rc";
         var result = await adbClient.ShellAsync(adbSerial, script, ShellTimeout, cancellationToken);
         var lines = result.StandardOutput.Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries);
@@ -179,6 +221,11 @@ public sealed class GlassesAcmService(AdbClient adbClient)
             return "盒子上未安装 python3，无法查询眼镜版本";
         }
 
+        if (probe.Contains("ACM_HELPER_MISSING", StringComparison.Ordinal))
+        {
+            return "盒子上眼镜助手脚本缺失，写入可能失败";
+        }
+
         for (var index = 0; index < requests.Length; index++)
         {
             if (probe.Contains($"{MissingMarker}{index}", StringComparison.Ordinal))
@@ -187,6 +234,11 @@ public sealed class GlassesAcmService(AdbClient adbClient)
             }
         }
 
+        return Tail(result);
+    }
+
+    private static string Tail(ProcessResult result)
+    {
         var detail = string.IsNullOrWhiteSpace(result.StandardError)
             ? result.StandardOutput
             : result.StandardError;
@@ -320,18 +372,17 @@ public sealed class GlassesAcmService(AdbClient adbClient)
     /// 参数：argv[1]=串口，之后按 (期望响应类型逗号分隔 hex, 请求帧 hex) 成对传入。
     /// </summary>
     private const string HelperSource = """
-        import fcntl, os, select, struct, sys, termios, time
+        import fcntl,os,select,struct,sys,termios,time
 
         TIOCMSET = 0x5402
         TIOCM_DTR = 0x002
         TIOCM_RTS = 0x004
         MAGIC = b'\x53\x59'
         VER = 0x03
-        TIMEOUT = 0.8
-        ROUNDS = 5
+        TIMEOUT = 1.5
+        ROUNDS = 8
         MARKER = '__ACM_RESP__='
         MISS = '__ACM_MISS__='
-
 
         def crc16(data):
             crc = 0xFFFF
@@ -340,7 +391,6 @@ public sealed class GlassesAcmService(AdbClient adbClient)
                 for _ in range(8):
                     crc = (crc >> 1) ^ 0xA001 if crc & 1 else crc >> 1
             return crc
-
 
         def pick(buf, wanted):
             index = buf.find(MAGIC)
@@ -378,7 +428,6 @@ public sealed class GlassesAcmService(AdbClient adbClient)
                         return hit
             return None
 
-
         def main(port, queries):
             fd = os.open(port, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
             try:
@@ -405,10 +454,7 @@ public sealed class GlassesAcmService(AdbClient adbClient)
             finally:
                 os.close(fd)
 
-
-        args = sys.argv[1:]
-        pairs = [(set(int(x, 16) for x in args[i].split(',')), bytes.fromhex(args[i + 1]))
-                 for i in range(1, len(args), 2)]
-        sys.exit(main(args[0], pairs))
+        a = sys.argv
+        sys.exit(main(a[1], [(set(int(x, 16) for x in a[i].split(',')), bytes.fromhex(a[i + 1])) for i in range(2, len(a), 2)]))
         """;
 }

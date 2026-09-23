@@ -11,6 +11,14 @@ public sealed class DeviceVersionService
 {
     private const string SnExitMarker = "__BOX_SN_RC__=";
     private const string VersionExitMarker = "__BOX_VER_RC__=";
+    private const string AppExitMarker = "__BOX_APP_RC__=";
+
+    // 段的顺序就是脚本中命令的顺序：SN、version、gen1-app。
+    private static readonly string[] BoxSectionKeys = ["sn", "version", "app"];
+    private static readonly string[] BoxSectionMarkers = [SnExitMarker, VersionExitMarker, AppExitMarker];
+
+    // 合并后一条 shell 要跑完 vendor_storage、version 和 dpkg-query，超时给到单次默认值的 1.5 倍。
+    private static readonly TimeSpan BoxShellTimeout = TimeSpan.FromSeconds(15);
 
     private readonly AdbClient _adbClient;
     private readonly IBandSerialVersionService _bandSerialVersionService;
@@ -81,14 +89,22 @@ public sealed class DeviceVersionService
         string serial,
         CancellationToken cancellationToken)
     {
-        // 单次 shell 取回 SN 与 version：sudo 权限在脚本内自判（root 直接跑，非 root 走 sudo -n），
-        // 两条命令的分段与各自的退出码用标记行带回，省掉一次 adb 往返和一次权限探测。
+        // 单次 shell 取回 SN、version 与 gen1-app 版本：sudo 权限在脚本内自判（root 直接跑，非 root 走 sudo -n），
+        // 三条命令的分段与各自的退出码用标记行带回，省掉两次 adb 往返和一次权限探测。
+        // 注意：标记常量自身已以 '=' 结尾，脚本里写成 echo 标记$?，不能再补一个 '='。
+        // dpkg-query 只查询包数据库，不需要 root。
         var script =
             "if [ \"$(id -u)\" = \"0\" ]; then SUDO=; else SUDO=\"sudo -n\"; fi; " +
-            $"$SUDO vendor_storage -r VENDOR_SN_ID -t string 2>&1; echo {SnExitMarker}=$?; " +
-            $"version 2>&1; echo {VersionExitMarker}=$?";
-        var result = await _adbClient.ShellAsync(serial, script, cancellationToken);
-        var (snOutput, snExitCode, versionOutput, versionExitCode) = SplitBoxOutput(result.StandardOutput);
+            $"$SUDO vendor_storage -r VENDOR_SN_ID -t string 2>&1; echo {SnExitMarker}$?; " +
+            $"version 2>&1; echo {VersionExitMarker}$?; " +
+            $"dpkg-query -W gen1-app 2>&1; echo {AppExitMarker}$?";
+        var result = await _adbClient.ShellAsync(serial, script, BoxShellTimeout, cancellationToken);
+        var sections = SplitBoxOutput(result.StandardOutput);
+        var snOutput = sections["sn"].Output;
+        var snExitCode = sections["sn"].ExitCode;
+        var versionOutput = sections["version"].Output;
+        var versionExitCode = sections["version"].ExitCode;
+        var appOutput = sections["app"].Output;
         if (snExitCode != 0)
         {
             throw new InvalidOperationException($"读取盒子设备 SN失败: {Describe(snOutput, result)}");
@@ -108,9 +124,24 @@ public sealed class DeviceVersionService
             throw new InvalidOperationException($"读取盒子版本失败: {Describe(versionOutput, result)}");
         }
 
+        if (sections["app"].ExitCode != 0)
+        {
+            throw new InvalidOperationException($"读取盒子 gen1-app 版本失败: {Describe(appOutput, result)}");
+        }
+
+        var appMatch = Regex.Match(
+            appOutput,
+            @"gen1-app\s+(?<value>[^\s\x1B]+)",
+            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+        if (!appMatch.Success)
+        {
+            throw new InvalidOperationException("dpkg-query 输出中没有 gen1-app 版本。");
+        }
+
         var values = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
         {
-            ["sn"] = match.Groups["sn"].Value.Trim()
+            ["sn"] = match.Groups["sn"].Value.Trim(),
+            ["gen1App"] = appMatch.Groups["value"].Value.Trim()
         };
         foreach (Match versionMatch in Regex.Matches(
                      versionOutput,
@@ -132,7 +163,7 @@ public sealed class DeviceVersionService
             DisplayName = "盒子",
             Required = true,
             State = QueryState.Success,
-            Source = "adb shell: vendor_storage + version",
+            Source = "adb shell: vendor_storage + version + dpkg-query",
             Values = values
         };
     }
@@ -161,37 +192,37 @@ public sealed class DeviceVersionService
     }
 
     /// <summary>
-    /// 按标记行把单次 shell 的输出切成 SN 段与 version 段，并取出各自的退出码。
+    /// 按标记行把单次 shell 的输出切成 SN、version、gen1-app 三段，并取出各自的退出码。
+    /// 标记必须按脚本顺序出现，最后一个标记之后的文本归到最后一段。
     /// </summary>
-    private static (string SnOutput, int SnExitCode, string VersionOutput, int VersionExitCode) SplitBoxOutput(
-        string standardOutput)
+    private static Dictionary<string, BoxSection> SplitBoxOutput(string standardOutput)
     {
-        var sn = new StringBuilder();
-        var version = new StringBuilder();
-        StringBuilder? target = sn;
-        var snExitCode = -1;
-        var versionExitCode = -1;
+        var outputs = BoxSectionKeys.Select(_ => new StringBuilder()).ToArray();
+        var exitCodes = Enumerable.Repeat(-1, BoxSectionKeys.Length).ToArray();
+        var index = 0;
         foreach (var line in standardOutput.Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries))
         {
-            if (TryReadExitCode(line, SnExitMarker, out var snCode))
+            if (index < BoxSectionMarkers.Length && TryReadExitCode(line, BoxSectionMarkers[index], out var code))
             {
-                snExitCode = snCode;
-                target = version;
+                exitCodes[index] = code;
+                index++;
                 continue;
             }
 
-            if (TryReadExitCode(line, VersionExitMarker, out var versionCode))
-            {
-                versionExitCode = versionCode;
-                target = null;
-                continue;
-            }
-
-            target?.AppendLine(line);
+            outputs[Math.Min(index, outputs.Length - 1)].AppendLine(line);
         }
 
-        return (sn.ToString(), snExitCode, version.ToString(), versionExitCode);
+        var sections = new Dictionary<string, BoxSection>(StringComparer.Ordinal);
+        for (var i = 0; i < BoxSectionKeys.Length; i++)
+        {
+            sections[BoxSectionKeys[i]] = new BoxSection(outputs[i].ToString(), exitCodes[i]);
+        }
+
+        return sections;
     }
+
+    /// <summary>单次 shell 中某一条命令的输出与退出码。</summary>
+    private readonly record struct BoxSection(string Output, int ExitCode);
 
     private static bool TryReadExitCode(string line, string marker, out int exitCode)
     {

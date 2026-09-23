@@ -96,7 +96,25 @@ public sealed partial class BandSerialVersionService : IBandSerialVersionService
             }
         }
 
-        var hasBothSerials = values.ContainsKey("leftSn") && values.ContainsKey("rightSn");
+        // 必须是"一左一右"两只不同的手环才允许上报：任一侧缺失、任一侧读到多只、
+        // 或左右 SN 相同（同一只手环被当成左右两只）都判为不合法，并清空左右 SN 阻断上报。
+        var pairingError = ValidateHandPairing(
+            CountHand(probes, "left"),
+            CountHand(probes, "right"),
+            values.GetValueOrDefault("leftSn"),
+            values.GetValueOrDefault("rightSn"));
+        if (pairingError is not null)
+        {
+            AddUnique(errors, pairingError);
+            foreach (var key in new[] { "leftSn", "leftVersion", "rightSn", "rightVersion" })
+            {
+                values[key] = string.Empty;
+            }
+
+            sourcePorts.Clear();
+        }
+
+        var hasBothSerials = HasValue(values, "leftSn") && HasValue(values, "rightSn");
         var source = sourcePorts.Count > 0
             ? $"本机串口 {BaudRate} 8N1: {string.Join(", ", sourcePorts)}"
             : $"本机串口 {BaudRate} 8N1";
@@ -113,6 +131,38 @@ public sealed partial class BandSerialVersionService : IBandSerialVersionService
             Values = values
         };
     }
+
+    /// <summary>
+    /// 校验左右手环配对：有且仅有一只左手环和一只右手环，且两者 SN 不同。
+    /// 返回 null 表示配对合法，否则返回阻断上报的原因。
+    /// </summary>
+    internal static string? ValidateHandPairing(int leftCount, int rightCount, string? leftSn, string? rightSn)
+    {
+        if (leftCount == 0 || string.IsNullOrWhiteSpace(leftSn))
+        {
+            return "未读取到左手手环 SN";
+        }
+
+        if (rightCount == 0 || string.IsNullOrWhiteSpace(rightSn))
+        {
+            return "未读取到右手手环 SN";
+        }
+
+        if (leftCount > 1 || rightCount > 1)
+        {
+            return $"左右手环未正确配对：检测到左手环 {leftCount} 只、右手环 {rightCount} 只";
+        }
+
+        return string.Equals(leftSn!.Trim(), rightSn!.Trim(), StringComparison.OrdinalIgnoreCase)
+            ? $"左手环与右手环 SN 相同（{leftSn.Trim()}），可能只接了一只手环"
+            : null;
+    }
+
+    private static int CountHand(IEnumerable<BandProbe> probes, string hand) =>
+        probes.Count(probe => string.Equals(probe.Hand, hand, StringComparison.OrdinalIgnoreCase));
+
+    private static bool HasValue(IReadOnlyDictionary<string, string> values, string key) =>
+        values.TryGetValue(key, out var value) && !string.IsNullOrWhiteSpace(value);
 
     /// <summary>
     /// 并行探测所有候选串口。手环在 2Mbps 上响应是毫秒级的，真正的耗时来自"没有手环的口也要等满超时"，
