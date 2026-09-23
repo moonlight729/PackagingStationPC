@@ -15,12 +15,25 @@ public interface IBandSerialVersionService
 public sealed partial class BandSerialVersionService : IBandSerialVersionService
 {
     internal const int BaudRate = 2_000_000;
-    private const int HandQueryAttempts = 3;
+    private const int HandQueryAttempts = 2;
     private const int SnQueryAttempts = 2;
     private const int VersionQueryAttempts = 2;
-    private static readonly TimeSpan HandTimeout = TimeSpan.FromMilliseconds(1500);
-    private static readonly TimeSpan SnTimeout = TimeSpan.FromSeconds(2);
-    private static readonly TimeSpan VersionTimeout = TimeSpan.FromSeconds(2);
+
+    // 候选串口并行探测，避免"每个口串行等待满超时"把整轮采集拖到几十秒。
+    private const int MaxConcurrentProbes = 4;
+
+    private static readonly TimeSpan OpenSettleDelay = TimeSpan.FromMilliseconds(120);
+    private static readonly TimeSpan HandTimeout = TimeSpan.FromMilliseconds(700);
+    private static readonly TimeSpan SnTimeout = TimeSpan.FromMilliseconds(1200);
+    private static readonly TimeSpan VersionTimeout = TimeSpan.FromMilliseconds(1200);
+    private static readonly TimeSpan RetryDelay = TimeSpan.FromMilliseconds(150);
+    private static readonly TimeSpan PollInterval = TimeSpan.FromMilliseconds(10);
+
+    // 响应命中后不再死等固定尾部窗口，改为"收到最后一字节后再静默这么久"即可收尾。
+    private static readonly TimeSpan ResponseQuietWindow = TimeSpan.FromMilliseconds(120);
+    private static readonly TimeSpan MaxTrailingWindow = TimeSpan.FromMilliseconds(400);
+    private static readonly TimeSpan DrainQuietWindow = TimeSpan.FromMilliseconds(80);
+    private static readonly TimeSpan MaxDrainWindow = TimeSpan.FromMilliseconds(300);
     private static readonly byte[] ConsoleResync = "\r\n"u8.ToArray();
 
     public async Task<VersionComponentResult> QueryAsync(CancellationToken cancellationToken = default)
@@ -40,20 +53,7 @@ public sealed partial class BandSerialVersionService : IBandSerialVersionService
             .ToArray();
         var usedUsbFilter = identifiedBandPorts.Length > 0;
         var candidates = usedUsbFilter ? identifiedBandPorts : availablePorts;
-        var probes = new List<BandProbe>();
-
-        foreach (var portName in candidates)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-            try
-            {
-                probes.Add(await ProbeAsync(portName, cancellationToken));
-            }
-            catch (Exception ex) when (ex is not OperationCanceledException)
-            {
-                probes.Add(new BandProbe(portName, null, null, $"串口查询异常：{ex.Message}"));
-            }
-        }
+        var probes = await ProbePortsAsync(candidates, cancellationToken);
 
         var values = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         var errors = new List<string>();
@@ -114,6 +114,43 @@ public sealed partial class BandSerialVersionService : IBandSerialVersionService
         };
     }
 
+    /// <summary>
+    /// 并行探测所有候选串口。手环在 2Mbps 上响应是毫秒级的，真正的耗时来自"没有手环的口也要等满超时"，
+    /// 并行后整轮耗时约等于单个口的最坏耗时，而不再随串口数量线性增长。
+    /// </summary>
+    private static async Task<List<BandProbe>> ProbePortsAsync(
+        IReadOnlyCollection<string> candidates,
+        CancellationToken cancellationToken)
+    {
+        if (candidates.Count == 0)
+        {
+            return [];
+        }
+
+        using var gate = new SemaphoreSlim(Math.Min(MaxConcurrentProbes, candidates.Count));
+        var tasks = candidates.Select(async portName =>
+        {
+            await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+            try
+            {
+                return await ProbeAsync(portName, cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                return new BandProbe(portName, null, null, $"串口查询异常：{ex.Message}");
+            }
+            finally
+            {
+                gate.Release();
+            }
+        });
+
+        return (await Task.WhenAll(tasks).ConfigureAwait(false))
+            .OrderBy(probe => PortNumber(probe.PortName))
+            .ThenBy(probe => probe.PortName, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+
     private static async Task<BandProbe> ProbeAsync(string portName, CancellationToken cancellationToken)
     {
         using var port = new SerialPort(portName, BaudRate, Parity.None, 8, StopBits.One)
@@ -130,7 +167,7 @@ public sealed partial class BandSerialVersionService : IBandSerialVersionService
         try
         {
             await Task.Run(port.Open, cancellationToken);
-            await Task.Delay(300, cancellationToken);
+            await Task.Delay(OpenSettleDelay, cancellationToken);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
@@ -146,12 +183,11 @@ public sealed partial class BandSerialVersionService : IBandSerialVersionService
             await ResyncConsoleAsync(port, cancellationToken);
             port.DiscardInBuffer();
             await WriteLinePacedAsync(port, "hand", cancellationToken);
-            await Task.Delay(50, cancellationToken);
-            handResponse = await ReadUntilAsync(port, "hand=", HandTimeout, TimeSpan.FromMilliseconds(250), cancellationToken);
+            handResponse = await ReadUntilAsync(port, "hand=", HandTimeout, cancellationToken);
             hand = DeviceVersionParser.ParseBandHand(handResponse);
             if (hand is null && attempt < HandQueryAttempts)
             {
-                await Task.Delay(300, cancellationToken);
+                await Task.Delay(RetryDelay, cancellationToken);
             }
         }
 
@@ -171,12 +207,11 @@ public sealed partial class BandSerialVersionService : IBandSerialVersionService
             cancellationToken.ThrowIfCancellationRequested();
             port.DiscardInBuffer();
             await WriteLinePacedAsync(port, "sn", cancellationToken);
-            await Task.Delay(50, cancellationToken);
-            snResponse = await ReadUntilAsync(port, "sn=", SnTimeout, TimeSpan.FromMilliseconds(350), cancellationToken);
+            snResponse = await ReadUntilAsync(port, "sn=", SnTimeout, cancellationToken);
             sn = DeviceVersionParser.ParseBandSerial(snResponse);
             if (sn is null && attempt < SnQueryAttempts)
             {
-                await Task.Delay(300, cancellationToken);
+                await Task.Delay(RetryDelay, cancellationToken);
             }
         }
 
@@ -187,12 +222,11 @@ public sealed partial class BandSerialVersionService : IBandSerialVersionService
             cancellationToken.ThrowIfCancellationRequested();
             port.DiscardInBuffer();
             await WriteLinePacedAsync(port, "version", cancellationToken);
-            await Task.Delay(50, cancellationToken);
-            versionResponse = await ReadUntilAsync(port, "version=", VersionTimeout, TimeSpan.FromMilliseconds(350), cancellationToken);
+            versionResponse = await ReadUntilAsync(port, "version=", VersionTimeout, cancellationToken);
             version = DeviceVersionParser.ParseBandVersion(versionResponse);
             if (version is null && attempt < VersionQueryAttempts)
             {
-                await Task.Delay(300, cancellationToken);
+                await Task.Delay(RetryDelay, cancellationToken);
             }
         }
 
@@ -218,7 +252,7 @@ public sealed partial class BandSerialVersionService : IBandSerialVersionService
     private static async Task ResyncConsoleAsync(SerialPort port, CancellationToken cancellationToken)
     {
         port.Write(ConsoleResync, 0, ConsoleResync.Length);
-        await DrainInputAsync(port, TimeSpan.FromMilliseconds(200), cancellationToken);
+        await DrainInputAsync(port, MaxDrainWindow, DrainQuietWindow, cancellationToken);
     }
 
     private static async Task WriteLinePacedAsync(
@@ -236,38 +270,49 @@ public sealed partial class BandSerialVersionService : IBandSerialVersionService
         }
     }
 
+    /// <summary>
+    /// 排空输入缓冲：一直接收到"连续 quietDuration 没有新字节"为止，最长不超过 maxDuration。
+    /// 端口本来就没有输出时（绝大多数候选口）只需等一个静默窗口，而不是固定 200ms。
+    /// </summary>
     private static async Task DrainInputAsync(
         SerialPort port,
-        TimeSpan duration,
+        TimeSpan maxDuration,
+        TimeSpan quietDuration,
         CancellationToken cancellationToken)
     {
-        var deadline = Stopwatch.StartNew();
+        var elapsed = Stopwatch.StartNew();
+        var lastDataAt = TimeSpan.Zero;
         var buffer = new byte[512];
-        while (deadline.Elapsed < duration)
+        while (elapsed.Elapsed < maxDuration && elapsed.Elapsed - lastDataAt < quietDuration)
         {
             cancellationToken.ThrowIfCancellationRequested();
             var available = port.BytesToRead;
             if (available > 0)
             {
                 port.Read(buffer, 0, Math.Min(available, buffer.Length));
+                lastDataAt = elapsed.Elapsed;
             }
             else
             {
-                await Task.Delay(20, cancellationToken);
+                await Task.Delay(PollInterval, cancellationToken);
             }
         }
     }
 
+    /// <summary>
+    /// 读取直到出现 marker：命中后再等到"最后一字节后静默 ResponseQuietWindow"即可收尾，
+    /// 最多再等 MaxTrailingWindow，避免每条命令都固定多等 250~350ms。
+    /// </summary>
     private static async Task<string> ReadUntilAsync(
         SerialPort port,
         string marker,
         TimeSpan timeout,
-        TimeSpan trailingDuration,
         CancellationToken cancellationToken)
     {
         using var response = new MemoryStream();
         var elapsed = Stopwatch.StartNew();
         TimeSpan? markerSeenAt = null;
+        var lastDataAt = TimeSpan.Zero;
         var buffer = new byte[1024];
         while (elapsed.Elapsed < timeout)
         {
@@ -277,19 +322,22 @@ public sealed partial class BandSerialVersionService : IBandSerialVersionService
             {
                 var count = port.Read(buffer, 0, Math.Min(available, buffer.Length));
                 response.Write(buffer, 0, count);
+                lastDataAt = elapsed.Elapsed;
                 if (markerSeenAt is null &&
                     Encoding.UTF8.GetString(response.GetBuffer(), 0, checked((int)response.Length))
                         .Contains(marker, StringComparison.OrdinalIgnoreCase))
                 {
-                    markerSeenAt = elapsed.Elapsed;
+                    markerSeenAt = lastDataAt;
                 }
             }
             else
             {
-                await Task.Delay(20, cancellationToken);
+                await Task.Delay(PollInterval, cancellationToken);
             }
 
-            if (markerSeenAt is not null && elapsed.Elapsed - markerSeenAt.Value >= trailingDuration)
+            if (markerSeenAt is not null &&
+                (elapsed.Elapsed - lastDataAt >= ResponseQuietWindow ||
+                 elapsed.Elapsed - markerSeenAt.Value >= MaxTrailingWindow))
             {
                 break;
             }
