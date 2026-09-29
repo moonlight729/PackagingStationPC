@@ -19,10 +19,10 @@ public partial class App : Application
                 snGenerator);
             var processRunner = new ProcessRunner();
             var adbClient = new AdbClient(configuration.Adb, processRunner);
-            var bandSerialVersionService = new BandSerialVersionService();
+            var logger = new AppLogger(Path.Combine(ConfigurationService.GetLogDirectory(), "packaging-station.log"));
+            var bandSerialVersionService = new BandSerialVersionService(logger);
             var glassesAcmService = new GlassesAcmService(adbClient);
             var versionService = new DeviceVersionService(adbClient, bandSerialVersionService, glassesAcmService);
-            var logger = new AppLogger(Path.Combine(ConfigurationService.GetLogDirectory(), "packaging-station.log"));
             var uploadService = FactoryUploadServiceFactory.Create(configuration.FactorySystem, logger);
             var scannerService = new ScannerService();
             var viewModel = new MainViewModel(

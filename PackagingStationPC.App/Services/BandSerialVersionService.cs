@@ -15,19 +15,35 @@ public interface IBandSerialVersionService
 public sealed partial class BandSerialVersionService : IBandSerialVersionService
 {
     internal const int BaudRate = 2_000_000;
-    private const int HandQueryAttempts = 2;
+
+    // 手环刚上电/刚插入时 USB CDC 往往还没就绪，第一次探测会整体落空、
+    // 必须扫第二遍才成功。这里放宽等待窗口并加一轮补测，让第一遍就能读到。
+    private const int HandQueryAttempts = 3;
     private const int SnQueryAttempts = 2;
     private const int VersionQueryAttempts = 2;
 
     // 候选串口并行探测，避免"每个口串行等待满超时"把整轮采集拖到几十秒。
     private const int MaxConcurrentProbes = 4;
 
-    private static readonly TimeSpan OpenSettleDelay = TimeSpan.FromMilliseconds(120);
-    private static readonly TimeSpan HandTimeout = TimeSpan.FromMilliseconds(700);
-    private static readonly TimeSpan SnTimeout = TimeSpan.FromMilliseconds(1200);
-    private static readonly TimeSpan VersionTimeout = TimeSpan.FromMilliseconds(1200);
+    // 三层超时闸，保证任何异常（驱动卡死、手环无响应）都不会无限等待：
+    // TotalQueryBudget 整轮硬上限（含补测）、RoundBudget 单轮软上限、
+    // MinRetryBudget 剩余时间不足时直接放弃补测、RoundGrace 单轮收尾宽限。
+    private static readonly TimeSpan TotalQueryBudget = TimeSpan.FromSeconds(10);
+    private static readonly TimeSpan RoundBudget = TimeSpan.FromSeconds(5);
+    private static readonly TimeSpan MinRetryBudget = TimeSpan.FromSeconds(2.5);
+    private static readonly TimeSpan RoundGrace = TimeSpan.FromMilliseconds(500);
+
+    private static readonly TimeSpan OpenSettleDelay = TimeSpan.FromMilliseconds(300);
+    private static readonly TimeSpan HandTimeout = TimeSpan.FromMilliseconds(1000);
+    private static readonly TimeSpan SnTimeout = TimeSpan.FromMilliseconds(1500);
+    private static readonly TimeSpan VersionTimeout = TimeSpan.FromMilliseconds(1500);
     private static readonly TimeSpan RetryDelay = TimeSpan.FromMilliseconds(150);
+    private static readonly TimeSpan ColdStartRetryDelay = TimeSpan.FromMilliseconds(300);
     private static readonly TimeSpan PollInterval = TimeSpan.FromMilliseconds(10);
+
+    private readonly AppLogger? _logger;
+
+    public BandSerialVersionService(AppLogger? logger = null) => _logger = logger;
 
     // 响应命中后不再死等固定尾部窗口，改为"收到最后一字节后再静默这么久"即可收尾。
     private static readonly TimeSpan ResponseQuietWindow = TimeSpan.FromMilliseconds(120);
@@ -38,6 +54,7 @@ public sealed partial class BandSerialVersionService : IBandSerialVersionService
 
     public async Task<VersionComponentResult> QueryAsync(CancellationToken cancellationToken = default)
     {
+        var total = Stopwatch.StartNew();
         var availablePorts = SerialPort.GetPortNames()
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .OrderBy(PortNumber)
@@ -45,6 +62,7 @@ public sealed partial class BandSerialVersionService : IBandSerialVersionService
             .ToArray();
         if (availablePorts.Length == 0)
         {
+            await LogAsync("WARN", "Query failed: 电脑未检测到可用串口。");
             return Failure("电脑未检测到可用串口。");
         }
 
@@ -53,7 +71,68 @@ public sealed partial class BandSerialVersionService : IBandSerialVersionService
             .ToArray();
         var usedUsbFilter = identifiedBandPorts.Length > 0;
         var candidates = usedUsbFilter ? identifiedBandPorts : availablePorts;
-        var probes = await ProbePortsAsync(candidates, cancellationToken);
+        // 注册表只认出 0 或 1 个口时，"一左一右"必然凑不齐，直接退化为全量探测，省掉一轮往返。
+        if (usedUsbFilter && candidates.Length < 2 && availablePorts.Length > candidates.Length)
+        {
+            await LogAsync(
+                "WARN",
+                $"USB filter matched only [{string.Join(", ", candidates)}] of [{string.Join(", ", availablePorts)}], falling back to all ports.");
+            candidates = availablePorts;
+            usedUsbFilter = false;
+        }
+
+        // USB 过滤只用来排优先级，绝不用来排除：注册表经常漏掉刚插入、挂在 Hub 上或 PID 不同的那一只手环，
+        // 只探测命中口就会"必然缺一只手环"。被过滤掉的口留作兜底，需要时一起补测。
+        var filteredOutPorts = availablePorts
+            .Where(port => !candidates.Contains(port, StringComparer.OrdinalIgnoreCase))
+            .ToArray();
+        await LogAsync(
+            "INFO",
+            $"Query start ports=[{string.Join(", ", availablePorts)}], " +
+            $"filter={(usedUsbFilter ? "usb 303A" : "all")}, " +
+            $"candidates=[{string.Join(", ", candidates)}], " +
+            $"filteredOut=[{string.Join(", ", filteredOutPorts)}], budget={TotalQueryBudget.TotalSeconds:0.#}s");
+
+        var probes = await ProbePortsAsync(candidates, RoundBudget, cancellationToken);
+        await LogProbesAsync("round1", probes);
+
+        // 补测分两种成因：
+        // 1) 冷启动：刚上电的手环第一次开串口还在吐启动日志，没识别出手环或没读到 SN 的口再跑一轮；
+        // 2) 漏口兜底：只要还凑不齐"一左一右"，就把被 USB 过滤排除掉的口一并补上。
+        var retryPorts = RetryCandidates(probes);
+        if (filteredOutPorts.Length > 0 && NeedsMoreProbes(probes))
+        {
+            await LogAsync(
+                "WARN",
+                $"Filtered-out ports=[{string.Join(", ", filteredOutPorts)}] will be probed: 左右手环未凑齐。");
+            retryPorts = retryPorts
+                .Concat(filteredOutPorts)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+        }
+        if (retryPorts.Count > 0)
+        {
+            var remaining = TotalQueryBudget - total.Elapsed;
+            if (remaining >= MinRetryBudget)
+            {
+                await LogAsync(
+                    "WARN",
+                    $"Retry ports=[{string.Join(", ", retryPorts)}], remaining={remaining.TotalSeconds:0.#}s");
+                await Task.Delay(ColdStartRetryDelay, cancellationToken);
+                var retried = await ProbePortsAsync(
+                    retryPorts,
+                    TotalQueryBudget - total.Elapsed,
+                    cancellationToken);
+                await LogProbesAsync("round2", retried);
+                probes = Merge(probes, retried);
+            }
+            else
+            {
+                await LogAsync(
+                    "WARN",
+                    $"Retry skipped ports=[{string.Join(", ", retryPorts)}], remaining={remaining.TotalSeconds:0.#}s < {MinRetryBudget.TotalSeconds:0.#}s");
+            }
+        }
 
         var values = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         var errors = new List<string>();
@@ -118,14 +197,20 @@ public sealed partial class BandSerialVersionService : IBandSerialVersionService
         var source = sourcePorts.Count > 0
             ? $"本机串口 {BaudRate} 8N1: {string.Join(", ", sourcePorts)}"
             : $"本机串口 {BaudRate} 8N1";
+        var state = errors.Count == 0
+            ? QueryState.Success
+            : hasBothSerials ? QueryState.Warning : QueryState.Failed;
+        await LogAsync(
+            state is QueryState.Success ? "INFO" : "ERROR",
+            $"Query done elapsed={total.ElapsedMilliseconds} ms, state={state}, " +
+            $"values=[{string.Join(", ", values.Select(item => $"{item.Key}={item.Value}"))}], " +
+            $"source={source}, errors=[{string.Join("; ", errors)}]");
         return new VersionComponentResult
         {
+            State = state,
             Component = "band",
             DisplayName = "手环",
             Required = true,
-            State = errors.Count == 0
-                ? QueryState.Success
-                : hasBothSerials ? QueryState.Warning : QueryState.Failed,
             Source = source,
             Message = string.Join("; ", errors),
             Values = values
@@ -165,11 +250,78 @@ public sealed partial class BandSerialVersionService : IBandSerialVersionService
         values.TryGetValue(key, out var value) && !string.IsNullOrWhiteSpace(value);
 
     /// <summary>
+    /// 是否还需要继续找手环：左右没凑齐，或某一侧识别出手环却没读到 SN。
+    /// 一左一右且都读到 SN 时返回 false，不做任何多余探测，成功路径的耗时不受影响。
+    /// </summary>
+    internal static bool NeedsMoreProbes(IEnumerable<BandProbe> probes)
+    {
+        var list = probes.ToArray();
+        return CountHand(list, "left") == 0
+            || CountHand(list, "right") == 0
+            || list.Any(probe => probe.Hand is not null && string.IsNullOrWhiteSpace(probe.Serial));
+    }
+
+    /// <summary>
+    /// 需要补测的串口：没识别出手环，或识别出手环但没读到 SN。
+    /// 打不开（被占用/不存在）的口再试一次也不会变好，直接排除，避免浪费补测预算。
+    /// </summary>
+    internal static List<string> RetryCandidates(IEnumerable<BandProbe> probes) =>
+        probes
+            .Where(probe => probe.Retryable &&
+                            (probe.Hand is null || string.IsNullOrWhiteSpace(probe.Serial)))
+            .Select(probe => probe.PortName)
+            .ToList();
+
+    /// <summary>用补测结果覆盖第一轮：同一个口保留"信息更完整"的那次探测。</summary>
+    internal static List<BandProbe> Merge(IEnumerable<BandProbe> first, IEnumerable<BandProbe> second)
+    {
+        var merged = new Dictionary<string, BandProbe>(StringComparer.OrdinalIgnoreCase);
+        foreach (var probe in first)
+        {
+            merged[probe.PortName] = probe;
+        }
+
+        foreach (var probe in second)
+        {
+            if (!merged.TryGetValue(probe.PortName, out var existing) || Score(probe) > Score(existing))
+            {
+                merged[probe.PortName] = probe;
+            }
+        }
+
+        return merged.Values
+            .OrderBy(probe => PortNumber(probe.PortName))
+            .ThenBy(probe => probe.PortName, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+
+    // 读到 SN 的探测结果最优先，其次是识别出手环的，最后才是失败。
+    private static int Score(BandProbe probe) =>
+        !string.IsNullOrWhiteSpace(probe.Serial) ? 2 : probe.Hand is not null ? 1 : 0;
+
+    private async Task LogProbesAsync(string round, IEnumerable<BandProbe> probes)
+    {
+        foreach (var probe in probes)
+        {
+            await LogAsync(
+                string.IsNullOrWhiteSpace(probe.Error) ? "INFO" : "WARN",
+                $"Probe {round} port={probe.PortName}, hand={probe.Hand ?? "-"}, sn={probe.Serial ?? "-"}, " +
+                $"version={probe.Version ?? "-"}, elapsed={probe.ElapsedMilliseconds} ms, " +
+                $"error={probe.Error ?? "-"}");
+        }
+    }
+
+    private Task LogAsync(string level, string message) =>
+        _logger?.WriteAsync(level, $"[band] {message}") ?? Task.CompletedTask;
+
+    /// <summary>
     /// 并行探测所有候选串口。手环在 2Mbps 上响应是毫秒级的，真正的耗时来自"没有手环的口也要等满超时"，
     /// 并行后整轮耗时约等于单个口的最坏耗时，而不再随串口数量线性增长。
+    /// 整轮受 budget 约束：到点后未完成的口直接放弃，驱动卡在 Open 上也不会把采集拖死。
     /// </summary>
-    private static async Task<List<BandProbe>> ProbePortsAsync(
+    private async Task<List<BandProbe>> ProbePortsAsync(
         IReadOnlyCollection<string> candidates,
+        TimeSpan budget,
         CancellationToken cancellationToken)
     {
         if (candidates.Count == 0)
@@ -177,15 +329,27 @@ public sealed partial class BandSerialVersionService : IBandSerialVersionService
             return [];
         }
 
-        using var gate = new SemaphoreSlim(Math.Min(MaxConcurrentProbes, candidates.Count));
-        var tasks = candidates.Select(async portName =>
+        // 刻意不用 using：宽限期到点后可能还有探测任务在跑（例如驱动卡在 Open 上），
+        // 提前释放 CTS / 信号量会让这些任务抛 ObjectDisposedException 或永久挂起，
+        // 不释放则它们拿到取消信号后能自己收尾并关闭串口。两者都是纯托管对象，交给 GC 即可。
+        var roundCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        roundCts.CancelAfter(budget);
+        var roundToken = roundCts.Token;
+
+        var gate = new SemaphoreSlim(Math.Min(MaxConcurrentProbes, candidates.Count));
+
+        async Task<BandProbe> RunAsync(string portName)
         {
-            await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+            await gate.WaitAsync(roundToken).ConfigureAwait(false);
             try
             {
-                return await ProbeAsync(portName, cancellationToken).ConfigureAwait(false);
+                return await ProbeAsync(portName, roundToken).ConfigureAwait(false);
             }
-            catch (Exception ex) when (ex is not OperationCanceledException)
+            catch (OperationCanceledException)
+            {
+                return new BandProbe(portName, null, null, $"本轮探测超时（预算 {budget.TotalSeconds:0.#}s），已放弃该串口");
+            }
+            catch (Exception ex)
             {
                 return new BandProbe(portName, null, null, $"串口查询异常：{ex.Message}");
             }
@@ -193,16 +357,38 @@ public sealed partial class BandSerialVersionService : IBandSerialVersionService
             {
                 gate.Release();
             }
-        });
+        }
 
-        return (await Task.WhenAll(tasks).ConfigureAwait(false))
+        var pending = candidates
+            .Select(portName => (PortName: portName, Task: RunAsync(portName)))
+            .ToArray();
+        try
+        {
+            await Task.WhenAll(pending.Select(item => item.Task))
+                .WaitAsync(budget + RoundGrace, CancellationToken.None)
+                .ConfigureAwait(false);
+        }
+        catch (TimeoutException)
+        {
+            // 极少数驱动会在 Open 上卡死。宽限期到点后放弃未完成的口，保证整轮一定返回。
+            await LogAsync(
+                "ERROR",
+                $"Probe round exceeded budget={budget.TotalSeconds:0.#}s + grace={RoundGrace.TotalMilliseconds}ms, " +
+                "dropping unfinished ports.");
+        }
+
+        return pending
+            .Select(item => item.Task.IsCompletedSuccessfully
+                ? item.Task.Result
+                : new BandProbe(item.PortName, null, null, "打开串口无响应，已跳过该串口"))
             .OrderBy(probe => PortNumber(probe.PortName))
             .ThenBy(probe => probe.PortName, StringComparer.OrdinalIgnoreCase)
             .ToList();
     }
 
-    private static async Task<BandProbe> ProbeAsync(string portName, CancellationToken cancellationToken)
+    private async Task<BandProbe> ProbeAsync(string portName, CancellationToken cancellationToken)
     {
+        var watch = Stopwatch.StartNew();
         using var port = new SerialPort(portName, BaudRate, Parity.None, 8, StopBits.One)
         {
             Handshake = Handshake.None,
@@ -221,7 +407,14 @@ public sealed partial class BandSerialVersionService : IBandSerialVersionService
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            return new BandProbe(portName, null, null, $"打开串口失败：{ex.Message}");
+            // 端口被占用或不存在：重试也不会变好，标记为不可重试，别浪费补测预算。
+            await LogAsync("WARN", $"Command port={portName}, open failed: {ex.Message}");
+            return new BandProbe(
+                portName,
+                null,
+                null,
+                $"打开串口失败：{ex.Message}",
+                Retryable: false);
         }
 
         string handResponse = string.Empty;
@@ -232,12 +425,20 @@ public sealed partial class BandSerialVersionService : IBandSerialVersionService
             port.DiscardInBuffer();
             await ResyncConsoleAsync(port, cancellationToken);
             port.DiscardInBuffer();
+            var attemptWatch = Stopwatch.StartNew();
             await WriteLinePacedAsync(port, "hand", cancellationToken);
             handResponse = await ReadUntilAsync(port, "hand=", HandTimeout, cancellationToken);
             hand = DeviceVersionParser.ParseBandHand(handResponse);
-            if (hand is null && attempt < HandQueryAttempts)
+            if (hand is null)
             {
-                await Task.Delay(RetryDelay, cancellationToken);
+                await LogAsync(
+                    "WARN",
+                    $"Command port={portName}, cmd=hand, attempt={attempt}/{HandQueryAttempts}, " +
+                    $"elapsed={attemptWatch.ElapsedMilliseconds} ms{ResponseSuffix(handResponse)}");
+                if (attempt < HandQueryAttempts)
+                {
+                    await Task.Delay(RetryDelay, cancellationToken);
+                }
             }
         }
 
@@ -247,7 +448,8 @@ public sealed partial class BandSerialVersionService : IBandSerialVersionService
                 portName,
                 null,
                 null,
-                $"hand 命令重试 {HandQueryAttempts} 次仍无有效响应{ResponseSuffix(handResponse)}");
+                $"hand 命令重试 {HandQueryAttempts} 次仍无有效响应{ResponseSuffix(handResponse)}",
+                ElapsedMilliseconds: watch.ElapsedMilliseconds);
         }
 
         string snResponse = string.Empty;
@@ -256,12 +458,20 @@ public sealed partial class BandSerialVersionService : IBandSerialVersionService
         {
             cancellationToken.ThrowIfCancellationRequested();
             port.DiscardInBuffer();
+            var attemptWatch = Stopwatch.StartNew();
             await WriteLinePacedAsync(port, "sn", cancellationToken);
             snResponse = await ReadUntilAsync(port, "sn=", SnTimeout, cancellationToken);
             sn = DeviceVersionParser.ParseBandSerial(snResponse);
-            if (sn is null && attempt < SnQueryAttempts)
+            if (sn is null)
             {
-                await Task.Delay(RetryDelay, cancellationToken);
+                await LogAsync(
+                    "WARN",
+                    $"Command port={portName}, cmd=sn, attempt={attempt}/{SnQueryAttempts}, " +
+                    $"elapsed={attemptWatch.ElapsedMilliseconds} ms{ResponseSuffix(snResponse)}");
+                if (attempt < SnQueryAttempts)
+                {
+                    await Task.Delay(RetryDelay, cancellationToken);
+                }
             }
         }
 
@@ -271,12 +481,20 @@ public sealed partial class BandSerialVersionService : IBandSerialVersionService
         {
             cancellationToken.ThrowIfCancellationRequested();
             port.DiscardInBuffer();
+            var attemptWatch = Stopwatch.StartNew();
             await WriteLinePacedAsync(port, "version", cancellationToken);
             versionResponse = await ReadUntilAsync(port, "version=", VersionTimeout, cancellationToken);
             version = DeviceVersionParser.ParseBandVersion(versionResponse);
-            if (version is null && attempt < VersionQueryAttempts)
+            if (version is null)
             {
-                await Task.Delay(RetryDelay, cancellationToken);
+                await LogAsync(
+                    "WARN",
+                    $"Command port={portName}, cmd=version, attempt={attempt}/{VersionQueryAttempts}, " +
+                    $"elapsed={attemptWatch.ElapsedMilliseconds} ms{ResponseSuffix(versionResponse)}");
+                if (attempt < VersionQueryAttempts)
+                {
+                    await Task.Delay(RetryDelay, cancellationToken);
+                }
             }
         }
 
@@ -286,17 +504,25 @@ public sealed partial class BandSerialVersionService : IBandSerialVersionService
                 portName,
                 hand,
                 version,
-                $"sn 命令重试 {SnQueryAttempts} 次仍无 SN{ResponseSuffix(snResponse)}");
+                $"sn 命令重试 {SnQueryAttempts} 次仍无 SN{ResponseSuffix(snResponse)}",
+                ElapsedMilliseconds: watch.ElapsedMilliseconds);
         }
 
         return version is not null
-            ? new BandProbe(portName, hand, version, null, sn)
+            ? new BandProbe(
+                portName,
+                hand,
+                version,
+                null,
+                sn,
+                ElapsedMilliseconds: watch.ElapsedMilliseconds)
             : new BandProbe(
                 portName,
                 hand,
                 null,
                 $"version 命令重试 {VersionQueryAttempts} 次仍无版本号{ResponseSuffix(versionResponse)}",
-                sn);
+                sn,
+                ElapsedMilliseconds: watch.ElapsedMilliseconds);
     }
 
     private static async Task ResyncConsoleAsync(SerialPort port, CancellationToken cancellationToken)
@@ -407,8 +633,10 @@ public sealed partial class BandSerialVersionService : IBandSerialVersionService
                 return result;
             }
 
+            // 只认 Espressif 的 VID 303A，不再限定 PID：现场同一只手环在不同固件/启动模式下
+            // PID 会变，限定 PID 会漏掉其中一只。匹配放宽最多是多探几个口，不影响正确性。
             foreach (var deviceName in usb.GetSubKeyNames()
-                         .Where(name => name.StartsWith("VID_303A&PID_1001", StringComparison.OrdinalIgnoreCase)))
+                         .Where(name => name.StartsWith("VID_303A", StringComparison.OrdinalIgnoreCase)))
             {
                 using var device = usb.OpenSubKey(deviceName);
                 if (device is null)
@@ -474,12 +702,14 @@ public sealed partial class BandSerialVersionService : IBandSerialVersionService
         Message = message
     };
 
-    private sealed record BandProbe(
+    internal sealed record BandProbe(
         string PortName,
         string? Hand,
         string? Version,
         string? Error,
-        string? Serial = null);
+        string? Serial = null,
+        bool Retryable = true,
+        long ElapsedMilliseconds = 0);
 
     [GeneratedRegex("^COM(?<number>\\d+)$", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
     private static partial Regex ComPortNumberRegex();
