@@ -31,7 +31,14 @@ public static class VersionChecker
                 continue;
             }
 
+            // 期望值和最低版本都没配就没有判断依据，跳过这一项而不是误判失败。
+            if (string.IsNullOrWhiteSpace(check.Expected) && string.IsNullOrWhiteSpace(check.MinVersion))
+            {
+                continue;
+            }
+
             var field = check.Field.Trim();
+            var expected = check.Expected.Trim();
             var actual = component.Values.GetValueOrDefault(field);
             if (string.IsNullOrWhiteSpace(actual))
             {
@@ -43,7 +50,21 @@ public static class VersionChecker
                 failures.Add(new VersionCheckFailure(
                     field,
                     check.BlockOnFail,
-                    $"{field} 未读取到，无法校验（要求 >= {check.MinVersion}）"));
+                    $"{field} 未读取到，无法校验（{DescribeRequirement(expected, check.MinVersion)}）"));
+                continue;
+            }
+
+            // 配了期望值就按精确相等比较（开关位、配置项这类非版本字段），否则按最低版本比对。
+            if (expected.Length > 0)
+            {
+                if (!string.Equals(actual.Trim(), expected, StringComparison.Ordinal))
+                {
+                    failures.Add(new VersionCheckFailure(
+                        field,
+                        check.BlockOnFail,
+                        $"{field} 当前为 {actual.Trim()}，{DescribeRequirement(expected, check.MinVersion)}"));
+                }
+
                 continue;
             }
 
@@ -68,6 +89,9 @@ public static class VersionChecker
 
         return failures.Count == 0 ? VersionCheckResult.Pass() : new VersionCheckResult(failures);
     }
+
+    private static string DescribeRequirement(string expected, string minVersion) =>
+        expected.Length > 0 ? $"要求为 {expected}" : $"要求 >= {minVersion}";
 
     /// <summary>
     /// 比较版本号：只按 <c>x.y.z</c> 这样的数字点分串比较，忽略前导 <c>v</c>/<c>V</c>

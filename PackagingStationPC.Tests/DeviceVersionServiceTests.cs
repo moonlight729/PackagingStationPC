@@ -33,6 +33,78 @@ public sealed class DeviceVersionServiceTests
     }
 
     [Fact]
+    public async Task Collect_ReadsWlan0BtSwitch()
+    {
+        var snapshot = await CollectAsync(BoxOutputWithSwitch("1"));
+
+        var box = snapshot.Components.First(item => item.Component == "box");
+        Assert.Equal(QueryState.Success, box.State);
+        Assert.Equal("1", box.Values[DeviceVersionService.SwitchField]);
+    }
+
+    [Fact]
+    public async Task Collect_KeepsSwitchEmptyWhenTheFileIsUnreadable()
+    {
+        // cat 失败不该把整轮采集（连 SN 一起）拖成失败，开关留空交给校验配置去判。
+        var snapshot = await CollectAsync(BoxOutputWithSwitch("cat: No such file or directory", exitCode: 1));
+
+        var box = snapshot.Components.First(item => item.Component == "box");
+        Assert.Equal(QueryState.Success, box.State);
+        Assert.Equal("D1S0001V30W263200002", box.Values["sn"]);
+        Assert.Equal(string.Empty, box.Values[DeviceVersionService.SwitchField]);
+    }
+
+    [Fact]
+    public async Task Collect_FailsBoxWhenWlan0BtSwitchIsNotTheExpectedValue()
+    {
+        var configuration = new AppConfiguration
+        {
+            BoxVersion = new VersionCheckConfiguration
+            {
+                Enabled = true,
+                Checks =
+                [
+                    new VersionCheckItem
+                    {
+                        Field = DeviceVersionService.SwitchField,
+                        Expected = "0",
+                        AllowMissing = false
+                    }
+                ]
+            }
+        };
+
+        var snapshot = await CollectAsync(BoxOutputWithSwitch("1"), configuration);
+
+        var box = snapshot.Components.First(item => item.Component == "box");
+        Assert.Equal(QueryState.Failed, box.State);
+        Assert.Contains("wlan0BtSwitch 当前为 1，要求为 0", box.Message, StringComparison.Ordinal);
+        // 开关位不合格时该字段清空，SN 不受影响。
+        Assert.Equal(string.Empty, box.Values[DeviceVersionService.SwitchField]);
+        Assert.Equal("D1S0001V30W263200002", snapshot.DeviceSerial);
+    }
+
+    [Fact]
+    public async Task Collect_PassesBoxWhenWlan0BtSwitchMatches()
+    {
+        var configuration = new AppConfiguration
+        {
+            BoxVersion = new VersionCheckConfiguration
+            {
+                Enabled = true,
+                Checks =
+                [
+                    new VersionCheckItem { Field = DeviceVersionService.SwitchField, Expected = "0" }
+                ]
+            }
+        };
+
+        var snapshot = await CollectAsync(BoxOutputWithSwitch("0"), configuration);
+
+        Assert.Equal(QueryState.Success, snapshot.Components.First(item => item.Component == "box").State);
+    }
+
+    [Fact]
     public async Task Collect_ReportsBoxFailureWhenGen1AppIsMissing()
     {
         var snapshot = await CollectAsync(BoxOutput.Replace("__BOX_APP_RC__=0", "__BOX_APP_RC__=1"));
@@ -161,9 +233,58 @@ public sealed class DeviceVersionServiceTests
         Assert.Equal(QueryState.Success, snapshot.Components.First(item => item.Component == "band").State);
     }
 
+    [Fact]
+    public async Task Collect_FailsBandWhenItsVersionIsMissing()
+    {
+        // allowMissing=false：手环版本读不到即判失败，左右 SN 仍然保留。
+        var configuration = new AppConfiguration
+        {
+            BandVersion = new VersionCheckConfiguration
+            {
+                Enabled = true,
+                Checks =
+                [
+                    new VersionCheckItem { Field = "leftVersion", MinVersion = "3.0.3.6", AllowMissing = false },
+                    new VersionCheckItem { Field = "rightVersion", MinVersion = "3.0.3.6", AllowMissing = false }
+                ]
+            }
+        };
+
+        var snapshot = await CollectAsync(BoxOutput, configuration, includeBandVersions: false);
+
+        var band = snapshot.Components.First(item => item.Component == "band");
+        Assert.Equal(QueryState.Failed, band.State);
+        Assert.StartsWith(VersionChecker.FailurePrefix, band.Message, StringComparison.Ordinal);
+        Assert.Contains("未读取到，无法校验", band.Message, StringComparison.Ordinal);
+        Assert.Equal("V61S1.0-LEFT", band.Values["leftSn"]);
+        Assert.Equal("V61S1.0-RIGHT", band.Values["rightSn"]);
+    }
+
+    [Fact]
+    public async Task Collect_AllowsMissingBandVersionWhenConfigured()
+    {
+        var configuration = new AppConfiguration
+        {
+            BandVersion = new VersionCheckConfiguration
+            {
+                Enabled = true,
+                Checks = [new VersionCheckItem { Field = "leftVersion", MinVersion = "3.0.3.6", AllowMissing = true }]
+            }
+        };
+
+        var snapshot = await CollectAsync(BoxOutput, configuration, includeBandVersions: false);
+
+        Assert.Equal(QueryState.Success, snapshot.Components.First(item => item.Component == "band").State);
+    }
+
+    /// <summary>在原盒子输出后面拼上 wlan0_bt_switch 那一段（脚本里它是最后一条命令）。</summary>
+    private static string BoxOutputWithSwitch(string switchOutput, int exitCode = 0) =>
+        $"{BoxOutput}\n{switchOutput}\n__BOX_SW_RC__={exitCode}";
+
     private static async Task<DeviceVersionSnapshot> CollectAsync(
         string boxOutput,
-        AppConfiguration? configuration = null)
+        AppConfiguration? configuration = null,
+        bool includeBandVersions = true)
     {
         var runner = new RoutingProcessRunner()
             .On("devices", () => new ProcessResult(0, "List of devices attached\nadb-001 device", string.Empty, false))
@@ -171,28 +292,41 @@ public sealed class DeviceVersionServiceTests
             .On("base64 -d", () => new ProcessResult(0, "__ACM_RDY__=0", string.Empty, false))
             .On("python3", () => new ProcessResult(0, "__ACM_PORT__=/dev/cam0_acm1", string.Empty, false));
         var adb = new AdbClient(new AdbConfiguration { Path = "adb" }, runner);
-        var service = new DeviceVersionService(adb, new StubBandService(), new GlassesAcmService(adb), configuration);
+        var service = new DeviceVersionService(
+            adb,
+            new StubBandService { IncludeVersions = includeBandVersions },
+            new GlassesAcmService(adb),
+            configuration);
 
         return await service.CollectAsync("adb-001");
     }
 
     private sealed class StubBandService : IBandSerialVersionService
     {
-        public Task<VersionComponentResult> QueryAsync(CancellationToken cancellationToken = default) =>
-            Task.FromResult(new VersionComponentResult
+        public bool IncludeVersions { get; init; } = true;
+
+        public Task<VersionComponentResult> QueryAsync(CancellationToken cancellationToken = default)
+        {
+            var values = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["leftSn"] = "V61S1.0-LEFT",
+                ["rightSn"] = "V61S1.0-RIGHT"
+            };
+            if (IncludeVersions)
+            {
+                values["leftVersion"] = "1.0.0";
+                values["rightVersion"] = "1.0.0";
+            }
+
+            return Task.FromResult(new VersionComponentResult
             {
                 Component = "band",
                 DisplayName = "手环",
                 Required = true,
                 State = QueryState.Success,
-                Values = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
-                {
-                    ["leftSn"] = "V61S1.0-LEFT",
-                    ["rightSn"] = "V61S1.0-RIGHT",
-                    ["leftVersion"] = "1.0.0",
-                    ["rightVersion"] = "1.0.0"
-                }
+                Values = values
             });
+        }
     }
 
     private sealed class RoutingProcessRunner : IProcessRunner

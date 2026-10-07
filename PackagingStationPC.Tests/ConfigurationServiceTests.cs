@@ -59,7 +59,7 @@ public sealed class ConfigurationServiceTests
     }
 
     [Fact]
-    public void Load_LeavesEveryComponentDisabledWhenTheSectionsAreAbsent()
+    public void Load_DefaultsEveryComponentToEnabledButWithoutAnyCheck()
     {
         var path = Path.Combine(Path.GetTempPath(), $"appsettings-{Guid.NewGuid():N}.json");
         File.WriteAllText(path, """{ "stationCode": "PACKING-01" }""");
@@ -67,10 +67,14 @@ public sealed class ConfigurationServiceTests
         {
             var configuration = ConfigurationService.Load(path);
 
-            Assert.False(configuration.BoxVersion.Enabled);
-            Assert.False(configuration.GlassesVersion.Enabled);
-            Assert.False(configuration.BandVersion.Enabled);
+            // 三段默认开启，但没有任何规则；空规则不产生任何校验结论（见 VersionCheckerTests），
+            // 所以旧配置（文件里没有这三段）不会被误判成版本不合格。
+            Assert.True(configuration.BoxVersion.Enabled);
+            Assert.True(configuration.GlassesVersion.Enabled);
+            Assert.True(configuration.BandVersion.Enabled);
             Assert.Empty(configuration.BoxVersion.Checks);
+            Assert.Empty(configuration.GlassesVersion.Checks);
+            Assert.Empty(configuration.BandVersion.Checks);
         }
         finally
         {

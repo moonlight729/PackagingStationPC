@@ -74,16 +74,17 @@ PackagingStationPC.App\bin\Debug\net10.0-windows\appsettings.json
     "requireCompleteVersionSet": false
   },
   "boxVersion": {
-    "enabled": false,
+    "enabled": true,
     "checks": [
       { "field": "uboot", "minVersion": "0.1.1", "enabled": true, "blockOnFail": true },
       { "field": "kernel", "minVersion": "0.1.6", "enabled": true, "blockOnFail": true },
       { "field": "rootfs", "minVersion": "0.1.6", "enabled": true, "blockOnFail": true },
-      { "field": "gen1App", "minVersion": "0.5.2", "enabled": true, "blockOnFail": true }
+      { "field": "gen1App", "minVersion": "0.5.2", "enabled": true, "blockOnFail": true },
+      { "field": "wlan0BtSwitch", "expected": "0", "enabled": true, "blockOnFail": true, "allowMissing": false }
     ]
   },
   "glassesVersion": {
-    "enabled": false,
+    "enabled": true,
     "checks": [
       { "field": "uboot", "minVersion": "0.0.2", "enabled": true, "blockOnFail": true },
       { "field": "kernel", "minVersion": "0.0.7", "enabled": true, "blockOnFail": true },
@@ -92,10 +93,10 @@ PackagingStationPC.App\bin\Debug\net10.0-windows\appsettings.json
     ]
   },
   "bandVersion": {
-    "enabled": false,
+    "enabled": true,
     "checks": [
-      { "field": "leftVersion", "minVersion": "3.0.3.6", "enabled": true, "blockOnFail": true, "allowMissing": true },
-      { "field": "rightVersion", "minVersion": "3.0.3.6", "enabled": true, "blockOnFail": true, "allowMissing": true }
+      { "field": "leftVersion", "minVersion": "3.0.3.6", "enabled": true, "blockOnFail": true, "allowMissing": false },
+      { "field": "rightVersion", "minVersion": "3.0.3.6", "enabled": true, "blockOnFail": true, "allowMissing": false }
     ]
   },
   "factorySystem": {
@@ -225,11 +226,28 @@ dpkg-query -W gen1-app
 gen1-app	0.5.0-20260920-36.3dc2a236
 ```
 
-采集字段：`box.sn`、`box.uboot`、`box.kernel`、`box.rootfs`、`box.gen1App`。ADB transport serial 只用于选择连接，不作为产品 SN。
+最后读取盒子上的无线/蓝牙切换开关：
 
-三条命令合并在同一条 shell 中执行（SN 需要 root 或 `sudo -n`，`dpkg-query` 只查包数据库不需要 root），
-用 `__BOX_SN_RC__`、`__BOX_VER_RC__`、`__BOX_APP_RC__` 三个标记行分段并带回各自退出码，
-避免多次 adb 往返。其中任一条失败都视为盒子采集失败。`Gen1-APP` 未安装时 `dpkg-query` 退出码非 0。
+```sh
+cat /oem/config/wlan0_bt_switch
+```
+
+期望输出（要求为 `0`）：
+
+```text
+0
+```
+
+采集字段：`box.sn`、`box.uboot`、`box.kernel`、`box.rootfs`、`box.gen1App`、`box.wlan0BtSwitch`。
+ADB transport serial 只用于选择连接，不作为产品 SN。
+
+四条命令合并在同一条 shell 中执行（SN 需要 root 或 `sudo -n`，`dpkg-query` 只查包数据库不需要 root），
+用 `__BOX_SN_RC__`、`__BOX_VER_RC__`、`__BOX_APP_RC__`、`__BOX_SW_RC__` 四个标记行分段并带回各自退出码，
+避免多次 adb 往返。前三条中任一条失败都视为盒子采集失败（`Gen1-APP` 未安装时 `dpkg-query` 退出码非 0）。
+
+`cat` 这条是例外：开关文件在部分盒子上可能不存在或不可读，读不到时**不判采集失败**，
+只把 `wlan0BtSwitch` 留空，交给 5.4 的校验配置去判（默认 `allowMissing=false`，即读不到就算不合格）。
+这样避免一个配置项把整轮采集（连 SN 一起）拖成失败。
 
 ### 5.2 眼镜
 
@@ -343,13 +361,21 @@ band.rightVersion
 
 | 配置段 | 作用组件 | 可取字段 |
 |---|---|---|
-| `boxVersion` | 盒子 | `uboot`、`kernel`、`rootfs`、`gen1App` |
+| `boxVersion` | 盒子 | `uboot`、`kernel`、`rootfs`、`gen1App`、`wlan0BtSwitch` |
 | `glassesVersion` | 眼镜 | `uboot`、`kernel`、`rootfs`、`app` |
 | `bandVersion` | 手环 | `leftVersion`、`rightVersion` |
 
+每一项有两种判定方式，**二选一**：
+
+- 填 `minVersion` —— 按最低版本比对（适用场景：版本号）；
+- 填 `expected` —— 按精确值比对，trim 后必须完全相等（适用场景：开关位、配置项，如 `wlan0BtSwitch` 要求为 `0`）。
+
+两者都填时以 `expected` 为准；两者都不填则该项跳过。
+
 比对规则（`VersionChecker`）：
 
-- 只按 `x.y.z` 这样的数字点分串比较，**不比较 `-` 之后的构建信息**。比较前忽略前导 `v` / `V`，只取版本号开头的数字点分段：
+- **精确值（填了 `expected`）**：两侧 trim 后完全相等才算通过。开关位是精确匹配而不是"不低于"，`wlan0BtSwitch` 读到 `1` 即使比 `0` 大也不合格。
+- **最低版本（填了 `minVersion`）**：只按 `x.y.z` 这样的数字点分串比较，**不比较 `-` 之后的构建信息**。比较前忽略前导 `v` / `V`，只取版本号开头的数字点分段：
   - `v0.0.8-260909` → `0.0.8`
   - `0.5.0-20260920-36.3dc2a236` → `0.5.0`
 - 位数不同时缺失位按 0 处理，`0.1` 与 `0.1.0` 视为相等；
@@ -360,14 +386,15 @@ band.rightVersion
 
 | 字段 | 说明 |
 |---|---|
-| `enabled` | 组件总开关，默认 `false`。关闭时该组件完全不校验，行为与加这个动作之前一致 |
+| `enabled` | 组件总开关，**默认 `true`**，盒子/眼镜/手环三段都默认校验；只在临时停用时置 `false` |
 | `checks[].field` | 要校验的字段名，取值见上表 |
 | `checks[].minVersion` | 要求的最低版本，写成 `0.5.0` 这样的 `x.y.z` 即可 |
+| `checks[].expected` | 要求的精确值，如 `wlan0BtSwitch` 配 `"0"`；填了它就不看 `minVersion` |
 | `checks[].enabled` | 单条规则的开关，便于临时停用一项而不是整段删掉 |
 | `checks[].blockOnFail` | 失败时是否阻断，默认 `true` |
 | `checks[].allowMissing` | 该字段读不到时是否放行，默认 `false`（读不到即判失败） |
 
-手环版本是尽力读取的，给 `bandVersion` 配规则时建议把 `allowMissing` 设为 `true`，避免因为读不到版本就阻断整条流程。
+手环版本同样是硬要求：默认配置里 `bandVersion` 的 `allowMissing` 为 `false`，左右手环版本读不到即判失败并阻断。只有想让某个字段"读得到就比、读不到就算了"时才把它设为 `true`。
 
 校验失败时：
 

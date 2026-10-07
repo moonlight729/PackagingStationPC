@@ -171,6 +171,74 @@ public sealed class VersionCheckerTests
         Assert.Equal(["leftVersion"], result.Fields);
     }
 
+    [Fact]
+    public void Check_ComparesExpectedValueExactlyRatherThanByVersion()
+    {
+        var configuration = new VersionCheckConfiguration
+        {
+            Enabled = true,
+            Checks = [new VersionCheckItem { Field = "wlan0BtSwitch", Expected = "0" }]
+        };
+
+        Assert.True(VersionChecker.Check(Switch("0"), configuration).Passed);
+        // 开关位是精确相等，不是"不低于"：1 比 0 大也不算通过。
+        var failed = VersionChecker.Check(Switch("1"), configuration);
+        Assert.False(failed.Passed);
+        Assert.True(failed.Blocking);
+        Assert.Contains("wlan0BtSwitch 当前为 1，要求为 0", failed.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Check_TrimsBothSidesBeforeComparingExpectedValue()
+    {
+        var configuration = new VersionCheckConfiguration
+        {
+            Enabled = true,
+            Checks = [new VersionCheckItem { Field = "wlan0BtSwitch", Expected = "0" }]
+        };
+
+        // 文件末尾换行、前后空格都不该影响判定。
+        Assert.True(VersionChecker.Check(Switch("0\r\n"), configuration).Passed);
+        Assert.True(VersionChecker.Check(Switch(" 0 "), configuration).Passed);
+    }
+
+    [Fact]
+    public void Check_FailsWhenExpectedValueIsMissingAndNotAllowed()
+    {
+        var configuration = new VersionCheckConfiguration
+        {
+            Enabled = true,
+            Checks = [new VersionCheckItem { Field = "wlan0BtSwitch", Expected = "0", AllowMissing = false }]
+        };
+
+        var result = VersionChecker.Check(Switch(string.Empty), configuration);
+
+        Assert.False(result.Passed);
+        Assert.Contains("要求为 0", result.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Check_PassesWhenTheSectionIsOnByDefaultButHasNoCheck()
+    {
+        // 默认开启 + 空规则 = 不校验。旧 appsettings.json（没有这三段）不会因为默认开启而被误判。
+        var configuration = new VersionCheckConfiguration();
+
+        Assert.True(configuration.Enabled);
+        Assert.True(VersionChecker.Check(Measured("box", "盒子", BoxValues), configuration).Passed);
+    }
+
+    [Fact]
+    public void Check_SkipsItemWithoutAnyRequirement()
+    {
+        var configuration = new VersionCheckConfiguration
+        {
+            Enabled = true,
+            Checks = [new VersionCheckItem { Field = "wlan0BtSwitch" }]
+        };
+
+        Assert.True(VersionChecker.Check(Switch("1"), configuration).Passed);
+    }
+
     /// <summary>
     /// 2026-10-07 16:33 那次完整采集的实测版本，配合 appsettings.json 里的默认 minVersion 必须全部通过。
     /// 换了新固件后如果这里红，说明默认配置该跟着调。
@@ -227,6 +295,12 @@ public sealed class VersionCheckerTests
         Assert.Null(VersionChecker.CompareVersion("unknown", "0.5.0"));
         Assert.Null(VersionChecker.CompareVersion("0.5.0", ""));
     }
+
+    private static VersionComponentResult Switch(string value) =>
+        Measured("box", "盒子", new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["wlan0BtSwitch"] = value
+        });
 
     private static VersionCheckConfiguration Configured(params (string Field, string MinVersion)[] checks) =>
         new()

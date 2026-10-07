@@ -72,8 +72,8 @@ public sealed class WorkflowConfiguration
 /// </summary>
 public sealed class VersionCheckConfiguration
 {
-    /// <summary>本组件的总开关，默认关闭；关闭时完全不执行校验，行为与加这个动作之前一致。</summary>
-    public bool Enabled { get; set; }
+    /// <summary>本组件的总开关，默认开启（盒子、眼镜、手环三段都要求默认校验），需要临时停用时显式置 false。</summary>
+    public bool Enabled { get; set; } = true;
 
     public List<VersionCheckItem> Checks { get; set; } = [];
 }
@@ -82,7 +82,7 @@ public sealed class VersionCheckConfiguration
 public sealed class VersionCheckItem
 {
     /// <summary>
-    /// 采集结果里的字段名。盒子可取 <c>uboot</c>、<c>kernel</c>、<c>rootfs</c>、<c>gen1App</c>；
+    /// 采集结果里的字段名。盒子可取 <c>uboot</c>、<c>kernel</c>、<c>rootfs</c>、<c>gen1App</c>、<c>wlan0BtSwitch</c>；
     /// 眼镜可取 <c>uboot</c>、<c>kernel</c>、<c>rootfs</c>、<c>app</c>；
     /// 手环可取 <c>leftVersion</c>、<c>rightVersion</c>。
     /// </summary>
@@ -90,6 +90,12 @@ public sealed class VersionCheckItem
 
     /// <summary>要求的最低版本，写成 <c>0.5.0</c> 这样的 <c>x.y.z</c>；比较时忽略前导 v/V 与 "-" 之后的构建信息。</summary>
     public string MinVersion { get; set; } = string.Empty;
+
+    /// <summary>
+    /// 要求的精确值（trim 后完全相等），用于版本之外的开关位、配置项，例如 <c>wlan0BtSwitch</c> 要求为 <c>0</c>。
+    /// 填了它就按相等比较，<see cref="MinVersion"/> 不再参与；两个都不填则该项跳过。
+    /// </summary>
+    public string Expected { get; set; } = string.Empty;
 
     /// <summary>本项是否参与校验，便于临时停用单条规则而不是整段删掉。</summary>
     public bool Enabled { get; set; } = true;
@@ -99,7 +105,7 @@ public sealed class VersionCheckItem
 
     /// <summary>
     /// 该字段读不到时是否放行，默认 false（读不到即判失败）。
-    /// 手环版本是尽力读取的，配手环时建议设为 true，避免因为读不到版本就阻断整条流程。
+    /// 想让某个字段"读得到就比、读不到就算了"时才设为 true。
     /// </summary>
     public bool AllowMissing { get; set; }
 }

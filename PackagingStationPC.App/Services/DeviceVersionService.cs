@@ -12,13 +12,21 @@ public sealed class DeviceVersionService
     private const string SnExitMarker = "__BOX_SN_RC__=";
     private const string VersionExitMarker = "__BOX_VER_RC__=";
     private const string AppExitMarker = "__BOX_APP_RC__=";
+    private const string SwitchExitMarker = "__BOX_SW_RC__=";
 
-    // 段的顺序就是脚本中命令的顺序：SN、version、gen1-app。
-    private static readonly string[] BoxSectionKeys = ["sn", "version", "app"];
-    private static readonly string[] BoxSectionMarkers = [SnExitMarker, VersionExitMarker, AppExitMarker];
+    // 段的顺序就是脚本中命令的顺序：SN、version、gen1-app、wlan0_bt_switch。
+    private static readonly string[] BoxSectionKeys = ["sn", "version", "app", "switch"];
+    private static readonly string[] BoxSectionMarkers =
+        [SnExitMarker, VersionExitMarker, AppExitMarker, SwitchExitMarker];
 
-    // 合并后一条 shell 要跑完 vendor_storage、version 和 dpkg-query，超时给到单次默认值的 1.5 倍。
+    // 合并后一条 shell 要跑完 vendor_storage、version、dpkg-query 和 cat，超时给到单次默认值的 1.5 倍。
     private static readonly TimeSpan BoxShellTimeout = TimeSpan.FromSeconds(15);
+
+    /// <summary>盒子上的蓝牙/无线切换开关配置文件，读到什么值由配置段决定。</summary>
+    private const string SwitchConfigPath = "/oem/config/wlan0_bt_switch";
+
+    /// <summary>该开关值在采集结果里的字段名。</summary>
+    public const string SwitchField = "wlan0BtSwitch";
 
     private readonly AdbClient _adbClient;
     private readonly IBandSerialVersionService _bandSerialVersionService;
@@ -159,15 +167,17 @@ public sealed class DeviceVersionService
         string serial,
         CancellationToken cancellationToken)
     {
-        // 单次 shell 取回 SN、version 与 gen1-app 版本：sudo 权限在脚本内自判（root 直接跑，非 root 走 sudo -n），
-        // 三条命令的分段与各自的退出码用标记行带回，省掉两次 adb 往返和一次权限探测。
+        // 单次 shell 取回 SN、version、gen1-app 版本和 wlan0_bt_switch 开关：
+        // sudo 权限在脚本内自判（root 直接跑，非 root 走 sudo -n），
+        // 四条命令的分段与各自的退出码用标记行带回，省掉多次 adb 往返和一次权限探测。
         // 注意：标记常量自身已以 '=' 结尾，脚本里写成 echo 标记$?，不能再补一个 '='。
         // dpkg-query 只查询包数据库，不需要 root。
         var script =
             "if [ \"$(id -u)\" = \"0\" ]; then SUDO=; else SUDO=\"sudo -n\"; fi; " +
             $"$SUDO vendor_storage -r VENDOR_SN_ID -t string 2>&1; echo {SnExitMarker}$?; " +
             $"version 2>&1; echo {VersionExitMarker}$?; " +
-            $"dpkg-query -W gen1-app 2>&1; echo {AppExitMarker}$?";
+            $"dpkg-query -W gen1-app 2>&1; echo {AppExitMarker}$?; " +
+            $"cat {SwitchConfigPath} 2>&1; echo {SwitchExitMarker}$?";
         var result = await _adbClient.ShellAsync(serial, script, BoxShellTimeout, cancellationToken);
         var sections = SplitBoxOutput(result.StandardOutput);
         var snOutput = sections["sn"].Output;
@@ -227,13 +237,17 @@ public sealed class DeviceVersionService
             throw new InvalidOperationException("盒子 version 输出缺少 uboot、kernel 或 rootfs 版本。");
         }
 
+        // 开关文件在部分盒子上可能不存在或不可读：这里不抛异常，留空交给校验配置去判，
+        // 免得一个配置项把整轮采集（连 SN 一起）拖成失败。
+        values[SwitchField] = ReadFirstLine(sections["switch"]);
+
         return new VersionComponentResult
         {
             Component = "box",
             DisplayName = "盒子",
             Required = true,
             State = QueryState.Success,
-            Source = "adb shell: vendor_storage + version + dpkg-query",
+            Source = "adb shell: vendor_storage + version + dpkg-query + wlan0_bt_switch",
             Values = values
         };
     }
@@ -262,7 +276,7 @@ public sealed class DeviceVersionService
     }
 
     /// <summary>
-    /// 按标记行把单次 shell 的输出切成 SN、version、gen1-app 三段，并取出各自的退出码。
+    /// 按标记行把单次 shell 的输出切成 SN、version、gen1-app、wlan0_bt_switch 四段，并取出各自的退出码。
     /// 标记必须按脚本顺序出现，最后一个标记之后的文本归到最后一段。
     /// </summary>
     private static Dictionary<string, BoxSection> SplitBoxOutput(string standardOutput)
@@ -293,6 +307,14 @@ public sealed class DeviceVersionService
 
     /// <summary>单次 shell 中某一条命令的输出与退出码。</summary>
     private readonly record struct BoxSection(string Output, int ExitCode);
+
+    /// <summary>取开关文件输出的首行；命令失败或没有内容时返回空串，由校验配置决定怎么判。</summary>
+    private static string ReadFirstLine(BoxSection section) =>
+        section.ExitCode == 0
+            ? section.Output.Split(
+                ['\r', '\n'],
+                StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).FirstOrDefault() ?? string.Empty
+            : string.Empty;
 
     private static bool TryReadExitCode(string line, string marker, out int exitCode)
     {
