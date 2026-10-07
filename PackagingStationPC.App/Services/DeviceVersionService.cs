@@ -23,15 +23,22 @@ public sealed class DeviceVersionService
     private readonly AdbClient _adbClient;
     private readonly IBandSerialVersionService _bandSerialVersionService;
     private readonly GlassesAcmService _glassesAcmService;
+    private readonly VersionCheckConfiguration _boxVersion;
+    private readonly VersionCheckConfiguration _glassesVersion;
+    private readonly VersionCheckConfiguration _bandVersion;
 
     public DeviceVersionService(
         AdbClient adbClient,
         IBandSerialVersionService bandSerialVersionService,
-        GlassesAcmService glassesAcmService)
+        GlassesAcmService glassesAcmService,
+        AppConfiguration? configuration = null)
     {
         _adbClient = adbClient;
         _bandSerialVersionService = bandSerialVersionService;
         _glassesAcmService = glassesAcmService;
+        _boxVersion = configuration?.BoxVersion ?? new VersionCheckConfiguration();
+        _glassesVersion = configuration?.GlassesVersion ?? new VersionCheckConfiguration();
+        _bandVersion = configuration?.BandVersion ?? new VersionCheckConfiguration();
     }
 
     public event Action<string>? ProgressChanged;
@@ -73,6 +80,10 @@ public sealed class DeviceVersionService
         var bandTask = TimedAsync("手环", "band", () => _bandSerialVersionService.QueryAsync(cancellationToken));
 
         var components = await Task.WhenAll(boxTask, glassesTask, bandTask);
+
+        // 全部版本号读完之后才做的独立动作：按配置项比对各组件版本。采集结果本身不受影响。
+        ApplyVersionChecks(components);
+
         var breakdown = string.Join(" / ", new[] { "盒子", "眼镜", "手环" }
             .Select(name => $"{name} {timings.GetValueOrDefault(name)} ms"));
         ProgressChanged?.Invoke($"版本读取完成，耗时 {total.ElapsedMilliseconds} ms（{breakdown}）。");
@@ -84,6 +95,65 @@ public sealed class DeviceVersionService
             Components = components
         };
     }
+
+    /// <summary>
+    /// 采集结束后的独立动作：把每个组件读到的版本逐项与它自己配置段里的期望（最低）版本比对。
+    /// 盒子、眼镜、手环各用各的配置段与开关，互不影响；采集过程本身不动。
+    /// </summary>
+    private void ApplyVersionChecks(VersionComponentResult[] components)
+    {
+        for (var index = 0; index < components.Length; index++)
+        {
+            var component = components[index];
+            var configuration = ChecksFor(component.Component);
+            if (configuration is null)
+            {
+                continue;
+            }
+
+            var result = VersionChecker.Check(component, configuration);
+            if (result.Passed)
+            {
+                continue;
+            }
+
+            // 失败项的值清空（与手环左右配对失效时的处理一致），让既有的"必需字段非空"门禁
+            // 一起拦住，避免带着不合格的版本继续绑定和上报；
+            // SN 类字段不清空，保证 DeviceSerial 与绑定关系始终可用。
+            var values = new Dictionary<string, string>(component.Values, StringComparer.OrdinalIgnoreCase);
+            foreach (var field in result.Fields.Where(field => values.ContainsKey(field) && !IsSerialField(field)))
+            {
+                values[field] = string.Empty;
+            }
+
+            var message = $"{VersionChecker.FailurePrefix}{result.Message}";
+            components[index] = new VersionComponentResult
+            {
+                Component = component.Component,
+                DisplayName = component.DisplayName,
+                Required = component.Required,
+                State = result.Blocking ? QueryState.Failed : QueryState.Warning,
+                Source = component.Source,
+                Message = message,
+                Values = values
+            };
+
+            ProgressChanged?.Invoke($"{component.DisplayName}{message}");
+        }
+    }
+
+    private VersionCheckConfiguration? ChecksFor(string component) => component switch
+    {
+        "box" => _boxVersion,
+        "glasses" => _glassesVersion,
+        "band" => _bandVersion,
+        _ => null
+    };
+
+    private static bool IsSerialField(string field) =>
+        field.Equals("sn", StringComparison.OrdinalIgnoreCase) ||
+        field.Equals("leftSn", StringComparison.OrdinalIgnoreCase) ||
+        field.Equals("rightSn", StringComparison.OrdinalIgnoreCase);
 
     private async Task<VersionComponentResult> QueryBoxAsync(
         string serial,

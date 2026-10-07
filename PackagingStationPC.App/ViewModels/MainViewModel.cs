@@ -367,6 +367,15 @@ public sealed class MainViewModel : ObservableObject
         var missing = new List<string>();
         var box = snapshot.Components.FirstOrDefault(item => item.Component == "box");
         Require(box, "盒子", "sn", "uboot", "kernel", "rootfs", "gen1App");
+        // 版本读到了但没通过配置的最低版本校验时，字段值被清空，上面的 Require 只会报"缺失"，
+        // 这里把校验明细补进去；盒子、眼镜、手环只要有任一组件没过校验就一律阻断，
+        // 不让不合格的版本绑定和上报。读取失败（没有这个前缀）不在这里重复报。
+        foreach (var component in snapshot.Components.Where(item =>
+                     item.Message.StartsWith(VersionChecker.FailurePrefix, StringComparison.Ordinal)))
+        {
+            missing.Add($"{component.DisplayName}.{component.Message}");
+        }
+
         var glasses = snapshot.Components.FirstOrDefault(item => item.Component == "glasses");
         Require(glasses, "眼镜", "sn", "uboot", "kernel", "rootfs", "app");
         var band = snapshot.Components.FirstOrDefault(item => item.Component == "band");

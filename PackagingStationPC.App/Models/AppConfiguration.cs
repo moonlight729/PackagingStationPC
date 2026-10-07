@@ -9,6 +9,9 @@ public sealed class AppConfiguration
     public FactorySystemConfiguration FactorySystem { get; set; } = new();
     public PrinterConfiguration Printer { get; set; } = new();
     public WorkflowConfiguration Workflow { get; set; } = new();
+    public VersionCheckConfiguration BoxVersion { get; set; } = new();
+    public VersionCheckConfiguration GlassesVersion { get; set; } = new();
+    public VersionCheckConfiguration BandVersion { get; set; } = new();
 }
 
 public sealed class AdbConfiguration
@@ -61,4 +64,42 @@ public sealed class WorkflowConfiguration
 {
     public bool RequireUploadBeforeNext { get; set; } = true;
     public bool RequirePrintBeforeNext { get; set; } = true;
+}
+
+/// <summary>
+/// 单个组件的版本配置校验。这是一个独立于采集的动作：等全部版本号都读完之后，
+/// 再把该组件读到的版本逐项与这里配置的最低版本比对。
+/// </summary>
+public sealed class VersionCheckConfiguration
+{
+    /// <summary>本组件的总开关，默认关闭；关闭时完全不执行校验，行为与加这个动作之前一致。</summary>
+    public bool Enabled { get; set; }
+
+    public List<VersionCheckItem> Checks { get; set; } = [];
+}
+
+/// <summary>单个版本字段的校验项。</summary>
+public sealed class VersionCheckItem
+{
+    /// <summary>
+    /// 采集结果里的字段名。盒子可取 <c>uboot</c>、<c>kernel</c>、<c>rootfs</c>、<c>gen1App</c>；
+    /// 眼镜可取 <c>uboot</c>、<c>kernel</c>、<c>rootfs</c>、<c>app</c>；
+    /// 手环可取 <c>leftVersion</c>、<c>rightVersion</c>。
+    /// </summary>
+    public string Field { get; set; } = string.Empty;
+
+    /// <summary>要求的最低版本，写成 <c>0.5.0</c> 这样的 <c>x.y.z</c>；比较时忽略前导 v/V 与 "-" 之后的构建信息。</summary>
+    public string MinVersion { get; set; } = string.Empty;
+
+    /// <summary>本项是否参与校验，便于临时停用单条规则而不是整段删掉。</summary>
+    public bool Enabled { get; set; } = true;
+
+    /// <summary>失败时是否阻断。true（默认）把该组件置为 Failed 并禁止预留 SN 与上报；false 只置 Warning 提示。</summary>
+    public bool BlockOnFail { get; set; } = true;
+
+    /// <summary>
+    /// 该字段读不到时是否放行，默认 false（读不到即判失败）。
+    /// 手环版本是尽力读取的，配手环时建议设为 true，避免因为读不到版本就阻断整条流程。
+    /// </summary>
+    public bool AllowMissing { get; set; }
 }

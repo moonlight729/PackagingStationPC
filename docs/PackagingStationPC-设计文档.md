@@ -73,6 +73,31 @@ PackagingStationPC.App\bin\Debug\net10.0-windows\appsettings.json
     "peripheralTimeoutSeconds": 45,
     "requireCompleteVersionSet": false
   },
+  "boxVersion": {
+    "enabled": false,
+    "checks": [
+      { "field": "uboot", "minVersion": "0.1.1", "enabled": true, "blockOnFail": true },
+      { "field": "kernel", "minVersion": "0.1.6", "enabled": true, "blockOnFail": true },
+      { "field": "rootfs", "minVersion": "0.1.6", "enabled": true, "blockOnFail": true },
+      { "field": "gen1App", "minVersion": "0.5.2", "enabled": true, "blockOnFail": true }
+    ]
+  },
+  "glassesVersion": {
+    "enabled": false,
+    "checks": [
+      { "field": "uboot", "minVersion": "0.0.2", "enabled": true, "blockOnFail": true },
+      { "field": "kernel", "minVersion": "0.0.7", "enabled": true, "blockOnFail": true },
+      { "field": "rootfs", "minVersion": "0.0.6", "enabled": true, "blockOnFail": true },
+      { "field": "app", "minVersion": "0.1.0", "enabled": true, "blockOnFail": true }
+    ]
+  },
+  "bandVersion": {
+    "enabled": false,
+    "checks": [
+      { "field": "leftVersion", "minVersion": "3.0.3.6", "enabled": true, "blockOnFail": true, "allowMissing": true },
+      { "field": "rightVersion", "minVersion": "3.0.3.6", "enabled": true, "blockOnFail": true, "allowMissing": true }
+    ]
+  },
   "factorySystem": {
     "mode": "swiftmom",
     "baseUrl": "http://192.168.10.17:8080/swiftmom/api",
@@ -310,6 +335,50 @@ band.rightVersion
 
 手环采集全程写日志，前缀 `[band]`，包含候选串口来源、每个口的开串口结果、每条命令每次重试的响应摘要与耗时、补测原因与最终判定；排查时看日志里的 `Query start` / `Probe round1` / `Retry` / `Probe round2` / `Query done` 这几行即可。
 
+### 5.4 版本配置校验
+
+这是一个**独立于采集的动作**：等盒子、眼镜、手环的版本号全部读完之后才执行，不参与也不改变任何采集过程。
+
+盒子、眼镜、手环**各有一个配置段、各有一个开关**，形状完全一样，互不影响：
+
+| 配置段 | 作用组件 | 可取字段 |
+|---|---|---|
+| `boxVersion` | 盒子 | `uboot`、`kernel`、`rootfs`、`gen1App` |
+| `glassesVersion` | 眼镜 | `uboot`、`kernel`、`rootfs`、`app` |
+| `bandVersion` | 手环 | `leftVersion`、`rightVersion` |
+
+比对规则（`VersionChecker`）：
+
+- 只按 `x.y.z` 这样的数字点分串比较，**不比较 `-` 之后的构建信息**。比较前忽略前导 `v` / `V`，只取版本号开头的数字点分段：
+  - `v0.0.8-260909` → `0.0.8`
+  - `0.5.0-20260920-36.3dc2a236` → `0.5.0`
+- 位数不同时缺失位按 0 处理，`0.1` 与 `0.1.0` 视为相等；
+- 读到的版本 **>= 配置项里的 `minVersion`** 才算通过；
+- 任一侧解析不出数字点分串时判为"无法比较"，按失败处理。
+
+每个配置段（以 `boxVersion` 为例，另两段同构）：
+
+| 字段 | 说明 |
+|---|---|
+| `enabled` | 组件总开关，默认 `false`。关闭时该组件完全不校验，行为与加这个动作之前一致 |
+| `checks[].field` | 要校验的字段名，取值见上表 |
+| `checks[].minVersion` | 要求的最低版本，写成 `0.5.0` 这样的 `x.y.z` 即可 |
+| `checks[].enabled` | 单条规则的开关，便于临时停用一项而不是整段删掉 |
+| `checks[].blockOnFail` | 失败时是否阻断，默认 `true` |
+| `checks[].allowMissing` | 该字段读不到时是否放行，默认 `false`（读不到即判失败） |
+
+手环版本是尽力读取的，给 `bandVersion` 配规则时建议把 `allowMissing` 设为 `true`，避免因为读不到版本就阻断整条流程。
+
+校验失败时：
+
+- 该组件置为 `Failed`（`blockOnFail=false` 时置 `Warning`，只提示不阻断），`Message` 带上逐项明细并以固定前缀 `版本校验未通过：` 开头，例如
+  `版本校验未通过：gen1App 版本 0.4.0 低于要求的最低版本 0.5.0`；
+- 失败项的值清空（与手环左右配对失效时的处理一致），让第 6 节的"必需字段非空"门禁一并拦住；
+- SN 类字段（`sn`、`leftSn`、`rightSn`）不清空，保证 `DeviceSerial`、左右配对判定与绑定关系不受影响；
+- 进度条与界面提示同步显示未通过原因。
+
+某个组件采集本身已经失败时不再叠加校验结论，避免把"读不到"误报成"版本不合格"。
+
 ## 6. 上报门禁
 
 扫码自动流程在写数据库和访问 MES 之前执行字段校验：
@@ -320,7 +389,10 @@ band.rightVersion
 | 眼镜 | `sn`、`uboot`、`kernel`、`rootfs`、`app` |
 | 手环 | `leftSn`、`rightSn` |
 
-此外，手环还必须通过左右配对校验（一左一右、SN 互不相同），该校验不受 `requireCompleteVersionSet` 开关影响，失败时同样禁止预留 SN 与上报。
+此外还有两项不受 `requireCompleteVersionSet` 开关影响、失败时同样禁止预留 SN 与上报的校验：
+
+- 手环左右配对（一左一右、SN 互不相同）；
+- 版本配置校验（见 5.4，盒子/眼镜/手环各一个开关，默认全关；开启后版本低于配置的最低版本即阻断）。
 
 任何必需字段为空时：
 

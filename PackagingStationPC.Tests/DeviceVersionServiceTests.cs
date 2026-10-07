@@ -62,7 +62,108 @@ public sealed class DeviceVersionServiceTests
         Assert.Contains("读取盒子设备 SN失败", box.Message, StringComparison.Ordinal);
     }
 
-    private static async Task<DeviceVersionSnapshot> CollectAsync(string boxOutput)
+    [Fact]
+    public async Task Collect_FailsBoxWhenVersionIsBelowConfiguredMinimum()
+    {
+        var configuration = new AppConfiguration
+        {
+            BoxVersion = new VersionCheckConfiguration
+            {
+                Enabled = true,
+                Checks = [new VersionCheckItem { Field = "gen1App", MinVersion = "0.6.0" }]
+            }
+        };
+
+        var snapshot = await CollectAsync(BoxOutput, configuration);
+
+        var box = snapshot.Components.First(item => item.Component == "box");
+        Assert.Equal(QueryState.Failed, box.State);
+        Assert.Contains("低于要求的最低版本 0.6.0", box.Message, StringComparison.Ordinal);
+        // 失败项的值被清空，让既有的"必需字段非空"门禁一并拦住。
+        Assert.Equal(string.Empty, box.Values["gen1App"]);
+        // 校验只针对版本字段，产品 SN 与其余链路不受影响。
+        Assert.Equal("D1S0001V30W263200002", snapshot.DeviceSerial);
+        Assert.Equal(QueryState.Success, snapshot.Components.First(item => item.Component == "band").State);
+    }
+
+    [Fact]
+    public async Task Collect_LeavesBoxAloneWhenVersionCheckPasses()
+    {
+        var configuration = new AppConfiguration
+        {
+            BoxVersion = new VersionCheckConfiguration
+            {
+                Enabled = true,
+                Checks = [new VersionCheckItem { Field = "gen1App", MinVersion = "0.5.0" }]
+            }
+        };
+
+        var snapshot = await CollectAsync(BoxOutput, configuration);
+
+        var box = snapshot.Components.First(item => item.Component == "box");
+        Assert.Equal(QueryState.Success, box.State);
+        Assert.Equal("0.5.0-20260920-36.3dc2a236", box.Values["gen1App"]);
+    }
+
+    [Fact]
+    public async Task Collect_FailsBandWithoutTouchingBox()
+    {
+        var configuration = new AppConfiguration
+        {
+            BandVersion = new VersionCheckConfiguration
+            {
+                Enabled = true,
+                Checks =
+                [
+                    new VersionCheckItem { Field = "leftVersion", MinVersion = "1.0.0" },
+                    new VersionCheckItem { Field = "rightVersion", MinVersion = "2.0.0" }
+                ]
+            }
+        };
+
+        var snapshot = await CollectAsync(BoxOutput, configuration);
+
+        var band = snapshot.Components.First(item => item.Component == "band");
+        Assert.Equal(QueryState.Failed, band.State);
+        Assert.Contains("低于要求的最低版本 2.0.0", band.Message, StringComparison.Ordinal);
+        Assert.Equal(string.Empty, band.Values["rightVersion"]);
+        // 版本被清空，但左右 SN 保留，配对判定与 DeviceSerial 不受影响。
+        Assert.Equal("V61S1.0-LEFT", band.Values["leftSn"]);
+        Assert.Equal("V61S1.0-RIGHT", band.Values["rightSn"]);
+        // 手环配置段不会影响盒子。
+        Assert.Equal(QueryState.Success, snapshot.Components.First(item => item.Component == "box").State);
+    }
+
+    [Fact]
+    public async Task Collect_EachComponentUsesItsOwnSwitch()
+    {
+        var configuration = new AppConfiguration
+        {
+            // 眼镜是关着的，盒子是开着的：只有盒子会被判失败。
+            GlassesVersion = new VersionCheckConfiguration
+            {
+                Enabled = false,
+                Checks = [new VersionCheckItem { Field = "app", MinVersion = "9.9.9" }]
+            },
+            BoxVersion = new VersionCheckConfiguration
+            {
+                Enabled = true,
+                Checks = [new VersionCheckItem { Field = "kernel", MinVersion = "9.9.9" }]
+            }
+        };
+
+        var snapshot = await CollectAsync(BoxOutput, configuration);
+
+        Assert.Equal(QueryState.Failed, snapshot.Components.First(item => item.Component == "box").State);
+        // 眼镜本来就没读到（采集失败），不受校验影响。
+        Assert.Equal(QueryState.Failed, snapshot.Components.First(item => item.Component == "glasses").State);
+        Assert.DoesNotContain(VersionChecker.FailurePrefix, snapshot.Components.First(item => item.Component == "glasses").Message, StringComparison.Ordinal);
+        Assert.Equal(QueryState.Success, snapshot.Components.First(item => item.Component == "band").State);
+    }
+
+    private static async Task<DeviceVersionSnapshot> CollectAsync(
+        string boxOutput,
+        AppConfiguration? configuration = null)
     {
         var runner = new RoutingProcessRunner()
             .On("devices", () => new ProcessResult(0, "List of devices attached\nadb-001 device", string.Empty, false))
@@ -70,7 +171,7 @@ public sealed class DeviceVersionServiceTests
             .On("base64 -d", () => new ProcessResult(0, "__ACM_RDY__=0", string.Empty, false))
             .On("python3", () => new ProcessResult(0, "__ACM_PORT__=/dev/cam0_acm1", string.Empty, false));
         var adb = new AdbClient(new AdbConfiguration { Path = "adb" }, runner);
-        var service = new DeviceVersionService(adb, new StubBandService(), new GlassesAcmService(adb));
+        var service = new DeviceVersionService(adb, new StubBandService(), new GlassesAcmService(adb), configuration);
 
         return await service.CollectAsync("adb-001");
     }
@@ -87,7 +188,9 @@ public sealed class DeviceVersionServiceTests
                 Values = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
                 {
                     ["leftSn"] = "V61S1.0-LEFT",
-                    ["rightSn"] = "V61S1.0-RIGHT"
+                    ["rightSn"] = "V61S1.0-RIGHT",
+                    ["leftVersion"] = "1.0.0",
+                    ["rightVersion"] = "1.0.0"
                 }
             });
     }
