@@ -20,24 +20,24 @@ public sealed class VersionCheckerTests
         var configuration = new VersionCheckConfiguration
         {
             Enabled = false,
-            Checks = [new VersionCheckItem { Field = "gen1App", MinVersion = "9.9.9" }]
+            Checks = [new VersionCheckItem { Field = "gen1App", Version = "9.9.9" }]
         };
 
         Assert.True(VersionChecker.Check(Box(QueryState.Success), configuration).Passed);
     }
 
     [Fact]
-    public void Check_PassesWhenEveryFieldMeetsMinimumVersion()
+    public void Check_PassesWhenEveryFieldMatchesTheRequiredVersion()
     {
         var configuration = new VersionCheckConfiguration
         {
             Enabled = true,
             Checks =
             [
-                new VersionCheckItem { Field = "gen1App", MinVersion = "0.5.0" },
-                new VersionCheckItem { Field = "kernel", MinVersion = "0.1.3" },
-                new VersionCheckItem { Field = "rootfs", MinVersion = "0.1.5" },
-                new VersionCheckItem { Field = "uboot", MinVersion = "0.0.8" }
+                new VersionCheckItem { Field = "gen1App", Version = "0.5.0" },
+                new VersionCheckItem { Field = "kernel", Version = "0.1.3" },
+                new VersionCheckItem { Field = "rootfs", Version = "0.1.5" },
+                new VersionCheckItem { Field = "uboot", Version = "0.0.8" }
             ]
         };
 
@@ -48,12 +48,12 @@ public sealed class VersionCheckerTests
     }
 
     [Fact]
-    public void Check_FailsWhenVersionIsBelowMinimum()
+    public void Check_FailsWhenVersionIsBelowTheRequiredOne()
     {
         var configuration = new VersionCheckConfiguration
         {
             Enabled = true,
-            Checks = [new VersionCheckItem { Field = "gen1App", MinVersion = "0.6.0" }]
+            Checks = [new VersionCheckItem { Field = "gen1App", Version = "0.6.0" }]
         };
 
         var result = VersionChecker.Check(Box(QueryState.Success), configuration);
@@ -61,7 +61,61 @@ public sealed class VersionCheckerTests
         Assert.False(result.Passed);
         Assert.True(result.Blocking);
         Assert.Equal(["gen1App"], result.Fields);
-        Assert.Contains("低于要求的最低版本 0.6.0", result.Message, StringComparison.Ordinal);
+        Assert.Contains("与要求的版本 0.6.0 不一致（低于）", result.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Check_FailsWhenVersionIsAboveTheRequiredOne()
+    {
+        // 版本必须完全一致：比要求的高同样不合格，避免现场跑着没验证过的固件。
+        var configuration = new VersionCheckConfiguration
+        {
+            Enabled = true,
+            Checks = [new VersionCheckItem { Field = "gen1App", Version = "0.4.0" }]
+        };
+
+        var result = VersionChecker.Check(Box(QueryState.Success), configuration);
+
+        Assert.False(result.Passed);
+        Assert.True(result.Blocking);
+        Assert.Contains("与要求的版本 0.4.0 不一致（高于）", result.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Check_AcceptsANewBuildOfTheSameVersion()
+    {
+        // 同一版本重新编译出的新构建号仍算一致，不用每次出包都改配置。
+        var values = new Dictionary<string, string>(BoxValues, StringComparer.OrdinalIgnoreCase)
+        {
+            ["gen1App"] = "0.5.0-20261001-99.deadbeef"
+        };
+        var configuration = new VersionCheckConfiguration
+        {
+            Enabled = true,
+            Checks = [new VersionCheckItem { Field = "gen1App", Version = "0.5.0" }]
+        };
+
+        Assert.True(VersionChecker.Check(Box(QueryState.Success, values), configuration).Passed);
+    }
+
+    [Fact]
+    public void Check_ReadsMinVersionAsAnAliasForBackwardCompatibility()
+    {
+        // 旧配置里的 minVersion 仍然识别，语义已改成"必须一致"。
+        var configuration = new VersionCheckConfiguration
+        {
+            Enabled = true,
+            Checks = [new VersionCheckItem { Field = "gen1App", MinVersion = "0.5.0" }]
+        };
+
+        Assert.True(VersionChecker.Check(Box(QueryState.Success), configuration).Passed);
+        Assert.False(VersionChecker.Check(
+            Box(QueryState.Success),
+            new VersionCheckConfiguration
+            {
+                Enabled = true,
+                Checks = [new VersionCheckItem { Field = "gen1App", MinVersion = "0.5.1" }]
+            }).Passed);
     }
 
     [Fact]
@@ -72,8 +126,8 @@ public sealed class VersionCheckerTests
             Enabled = true,
             Checks =
             [
-                new VersionCheckItem { Field = "gen1App", MinVersion = "9.9.9", Enabled = false },
-                new VersionCheckItem { Field = "kernel", MinVersion = "0.1.3" }
+                new VersionCheckItem { Field = "gen1App", Version = "9.9.9", Enabled = false },
+                new VersionCheckItem { Field = "kernel", Version = "0.1.3" }
             ]
         };
 
@@ -88,7 +142,7 @@ public sealed class VersionCheckerTests
         var configuration = new VersionCheckConfiguration
         {
             Enabled = true,
-            Checks = [new VersionCheckItem { Field = "gen1App", MinVersion = "0.5.0" }]
+            Checks = [new VersionCheckItem { Field = "gen1App", Version = "0.5.0" }]
         };
 
         var result = VersionChecker.Check(Box(QueryState.Success, values), configuration);
@@ -105,7 +159,7 @@ public sealed class VersionCheckerTests
         var configuration = new VersionCheckConfiguration
         {
             Enabled = true,
-            Checks = [new VersionCheckItem { Field = "gen1App", MinVersion = "0.5.0", AllowMissing = true }]
+            Checks = [new VersionCheckItem { Field = "gen1App", Version = "0.5.0", AllowMissing = true }]
         };
 
         Assert.True(VersionChecker.Check(Box(QueryState.Success, values), configuration).Passed);
@@ -117,7 +171,7 @@ public sealed class VersionCheckerTests
         var configuration = new VersionCheckConfiguration
         {
             Enabled = true,
-            Checks = [new VersionCheckItem { Field = "gen1App", MinVersion = "9.9.9", BlockOnFail = false }]
+            Checks = [new VersionCheckItem { Field = "gen1App", Version = "9.9.9", BlockOnFail = false }]
         };
 
         var result = VersionChecker.Check(Box(QueryState.Success), configuration);
@@ -132,7 +186,7 @@ public sealed class VersionCheckerTests
         var configuration = new VersionCheckConfiguration
         {
             Enabled = true,
-            Checks = [new VersionCheckItem { Field = "gen1App", MinVersion = "9.9.9" }]
+            Checks = [new VersionCheckItem { Field = "gen1App", Version = "9.9.9" }]
         };
 
         Assert.True(VersionChecker.Check(Box(QueryState.Failed), configuration).Passed);
@@ -160,8 +214,8 @@ public sealed class VersionCheckerTests
             Enabled = true,
             Checks =
             [
-                new VersionCheckItem { Field = "leftVersion", MinVersion = "1.0.0" },
-                new VersionCheckItem { Field = "rightVersion", MinVersion = "1.0.0" }
+                new VersionCheckItem { Field = "leftVersion", Version = "1.0.0" },
+                new VersionCheckItem { Field = "rightVersion", Version = "1.0.0" }
             ]
         };
 
@@ -240,25 +294,27 @@ public sealed class VersionCheckerTests
     }
 
     /// <summary>
-    /// 2026-10-07 16:33 那次完整采集的实测版本，配合 appsettings.json 里的默认 minVersion 必须全部通过。
-    /// 换了新固件后如果这里红，说明默认配置该跟着调。
+    /// 当前设备（D1S0100V38W263900191）2026-10-07 17:09 那次完整采集的实测版本，
+    /// 取自 logs/packaging-station.log，配合 appsettings.json 里的默认配置必须全部通过。
+    /// 这些值就是默认配置的来源；换设备或换固件后如果这里红，说明默认配置该跟着调。
     /// </summary>
     [Fact]
     public void Check_PassesWithTheMeasuredVersionsOfTheLastRun()
     {
         var box = Measured("box", "盒子", new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
         {
-            ["uboot"] = "v0.1.1-260920.053723-289545544",
-            ["kernel"] = "v0.1.6-260920.053745-289545544",
-            ["rootfs"] = "0.1.6",
-            ["gen1App"] = "0.5.2-20260929-65.e51ad76d"
+            ["uboot"] = "v0.1.1-261002.012924-9e315c057",
+            ["kernel"] = "v0.1.7-261002.012946-9e315c057",
+            ["rootfs"] = "0.1.7",
+            ["gen1App"] = "0.5.2-20260929-65.e51ad76d",
+            [DeviceVersionService.SwitchField] = "0"
         });
         var glasses = Measured("glasses", "眼镜", new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
         {
-            ["uboot"] = "V0.0.2-260901.101129-ee08c1496",
-            ["kernel"] = "V0.0.7-260901.101137-ee08c1496",
-            ["rootfs"] = "V0.0.6-260901.101156-ee08c1496",
-            ["app"] = "V0.1.0-260901.101237-ee08c1496"
+            ["uboot"] = "V0.0.2-260910.133246-1f5b58965",
+            ["kernel"] = "V0.0.8-260910.133254-1f5b58965",
+            ["rootfs"] = "V0.0.6-260910.133310-1f5b58965",
+            ["app"] = "V0.1.1-260910.133351-1f5b58965"
         });
         var band = Measured("band", "手环", new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
         {
@@ -266,10 +322,20 @@ public sealed class VersionCheckerTests
             ["rightVersion"] = "3.0.3.6"
         });
 
-        Assert.True(VersionChecker.Check(box, Configured(
-            ("uboot", "0.1.1"), ("kernel", "0.1.6"), ("rootfs", "0.1.6"), ("gen1App", "0.5.2"))).Passed);
+        Assert.True(VersionChecker.Check(box, new VersionCheckConfiguration
+        {
+            Enabled = true,
+            Checks =
+            [
+                new VersionCheckItem { Field = "uboot", Version = "0.1.1" },
+                new VersionCheckItem { Field = "kernel", Version = "0.1.7" },
+                new VersionCheckItem { Field = "rootfs", Version = "0.1.7" },
+                new VersionCheckItem { Field = "gen1App", Version = "0.5.2" },
+                new VersionCheckItem { Field = DeviceVersionService.SwitchField, Expected = "0" }
+            ]
+        }).Passed);
         Assert.True(VersionChecker.Check(glasses, Configured(
-            ("uboot", "0.0.2"), ("kernel", "0.0.7"), ("rootfs", "0.0.6"), ("app", "0.1.0"))).Passed);
+            ("uboot", "0.0.2"), ("kernel", "0.0.8"), ("rootfs", "0.0.6"), ("app", "0.1.1"))).Passed);
         Assert.True(VersionChecker.Check(band, Configured(
             ("leftVersion", "3.0.3.6"), ("rightVersion", "3.0.3.6"))).Passed);
     }
@@ -302,14 +368,14 @@ public sealed class VersionCheckerTests
             ["wlan0BtSwitch"] = value
         });
 
-    private static VersionCheckConfiguration Configured(params (string Field, string MinVersion)[] checks) =>
+    private static VersionCheckConfiguration Configured(params (string Field, string Version)[] checks) =>
         new()
         {
             Enabled = true,
             Checks = checks.Select(check => new VersionCheckItem
             {
                 Field = check.Field,
-                MinVersion = check.MinVersion
+                Version = check.Version
             }).ToList()
         };
 

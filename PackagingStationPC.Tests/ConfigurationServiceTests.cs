@@ -16,9 +16,10 @@ public sealed class ConfigurationServiceTests
               "boxVersion": {
                 "enabled": true,
                 "checks": [
-                  { "field": "gen1App", "minVersion": "0.5.0", "enabled": true, "blockOnFail": true }
+                  { "field": "gen1App", "version": "0.5.0", "enabled": true, "blockOnFail": true }
                 ]
               },
+              // 旧配置里的 minVersion 仍然要能读进来。
               "glassesVersion": {
                 "enabled": false,
                 "checks": [
@@ -28,8 +29,8 @@ public sealed class ConfigurationServiceTests
               "bandVersion": {
                 "enabled": true,
                 "checks": [
-                  { "field": "leftVersion", "minVersion": "1.0.0", "allowMissing": true },
-                  { "field": "rightVersion", "minVersion": "1.0.0", "enabled": false, "blockOnFail": false }
+                  { "field": "leftVersion", "version": "1.0.0", "allowMissing": true },
+                  { "field": "rightVersion", "version": "1.0.0", "enabled": false, "blockOnFail": false }
                 ]
               }
             }
@@ -40,12 +41,13 @@ public sealed class ConfigurationServiceTests
 
             Assert.True(configuration.BoxVersion.Enabled);
             Assert.Equal("gen1App", configuration.BoxVersion.Checks[0].Field);
-            Assert.Equal("0.5.0", configuration.BoxVersion.Checks[0].MinVersion);
+            Assert.Equal("0.5.0", configuration.BoxVersion.Checks[0].Version);
             Assert.True(configuration.BoxVersion.Checks[0].BlockOnFail);
             Assert.False(configuration.BoxVersion.Checks[0].AllowMissing);
 
             Assert.False(configuration.GlassesVersion.Enabled);
             Assert.Equal("app", configuration.GlassesVersion.Checks[0].Field);
+            Assert.Equal("0.1.0", configuration.GlassesVersion.Checks[0].MinVersion);
 
             Assert.True(configuration.BandVersion.Enabled);
             Assert.True(configuration.BandVersion.Checks[0].AllowMissing);

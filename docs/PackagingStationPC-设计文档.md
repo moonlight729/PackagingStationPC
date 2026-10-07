@@ -76,27 +76,27 @@ PackagingStationPC.App\bin\Debug\net10.0-windows\appsettings.json
   "boxVersion": {
     "enabled": true,
     "checks": [
-      { "field": "uboot", "minVersion": "0.1.1", "enabled": true, "blockOnFail": true },
-      { "field": "kernel", "minVersion": "0.1.6", "enabled": true, "blockOnFail": true },
-      { "field": "rootfs", "minVersion": "0.1.6", "enabled": true, "blockOnFail": true },
-      { "field": "gen1App", "minVersion": "0.5.2", "enabled": true, "blockOnFail": true },
+      { "field": "uboot", "version": "0.1.1", "enabled": true, "blockOnFail": true },
+      { "field": "kernel", "version": "0.1.7", "enabled": true, "blockOnFail": true },
+      { "field": "rootfs", "version": "0.1.7", "enabled": true, "blockOnFail": true },
+      { "field": "gen1App", "version": "0.5.2", "enabled": true, "blockOnFail": true },
       { "field": "wlan0BtSwitch", "expected": "0", "enabled": true, "blockOnFail": true, "allowMissing": false }
     ]
   },
   "glassesVersion": {
     "enabled": true,
     "checks": [
-      { "field": "uboot", "minVersion": "0.0.2", "enabled": true, "blockOnFail": true },
-      { "field": "kernel", "minVersion": "0.0.7", "enabled": true, "blockOnFail": true },
-      { "field": "rootfs", "minVersion": "0.0.6", "enabled": true, "blockOnFail": true },
-      { "field": "app", "minVersion": "0.1.0", "enabled": true, "blockOnFail": true }
+      { "field": "uboot", "version": "0.0.2", "enabled": true, "blockOnFail": true },
+      { "field": "kernel", "version": "0.0.8", "enabled": true, "blockOnFail": true },
+      { "field": "rootfs", "version": "0.0.6", "enabled": true, "blockOnFail": true },
+      { "field": "app", "version": "0.1.1", "enabled": true, "blockOnFail": true }
     ]
   },
   "bandVersion": {
     "enabled": true,
     "checks": [
-      { "field": "leftVersion", "minVersion": "3.0.3.6", "enabled": true, "blockOnFail": true, "allowMissing": false },
-      { "field": "rightVersion", "minVersion": "3.0.3.6", "enabled": true, "blockOnFail": true, "allowMissing": false }
+      { "field": "leftVersion", "version": "3.0.3.6", "enabled": true, "blockOnFail": true, "allowMissing": false },
+      { "field": "rightVersion", "version": "3.0.3.6", "enabled": true, "blockOnFail": true, "allowMissing": false }
     ]
   },
   "factorySystem": {
@@ -209,9 +209,9 @@ version
 期望输出：
 
 ```text
-uboot version:  v0.0.2-260824.095308-e4474f346
-kernel version: v0.1.1-260903.050734-436e50b1d
-rootfs version: 0.0.5
+uboot version:  v0.1.1-261002.012924-9e315c057
+kernel version: v0.1.7-261002.012946-9e315c057
+rootfs version: 0.1.7
 ```
 
 再读取盒子上 Gen1-APP（`gen1-app.service` 对应的 deb 包）的版本：
@@ -367,19 +367,21 @@ band.rightVersion
 
 每一项有两种判定方式，**二选一**：
 
-- 填 `minVersion` —— 按最低版本比对（适用场景：版本号）；
-- 填 `expected` —— 按精确值比对，trim 后必须完全相等（适用场景：开关位、配置项，如 `wlan0BtSwitch` 要求为 `0`）。
+- 填 `version` —— 版本号必须**完全一致**，高一点低一点都判失败（适用场景：版本号）；
+- 填 `expected` —— 字面精确值，trim 后必须完全相等（适用场景：开关位、配置项，如 `wlan0BtSwitch` 要求为 `0`）。
 
 两者都填时以 `expected` 为准；两者都不填则该项跳过。
+旧配置里的 `minVersion` 仍可识别，语义已与 `version` 相同（必须一致），不再表示"最低版本"。
 
 比对规则（`VersionChecker`）：
 
-- **精确值（填了 `expected`）**：两侧 trim 后完全相等才算通过。开关位是精确匹配而不是"不低于"，`wlan0BtSwitch` 读到 `1` 即使比 `0` 大也不合格。
-- **最低版本（填了 `minVersion`）**：只按 `x.y.z` 这样的数字点分串比较，**不比较 `-` 之后的构建信息**。比较前忽略前导 `v` / `V`，只取版本号开头的数字点分段：
+- **版本号（填了 `version`）**：必须**完全一致**，高一点低一点都不合格——现场只能跑验证过的那一个版本。
+  只按 `x.y.z` 这样的数字点分串比较，**不比较 `-` 之后的构建信息**。比较前忽略前导 `v` / `V`，只取版本号开头的数字点分段：
   - `v0.0.8-260909` → `0.0.8`
   - `0.5.0-20260920-36.3dc2a236` → `0.5.0`
-- 位数不同时缺失位按 0 处理，`0.1` 与 `0.1.0` 视为相等；
-- 读到的版本 **>= 配置项里的 `minVersion`** 才算通过；
+  - 位数不同时缺失位按 0 处理，`0.1` 与 `0.1.0` 视为相等
+  - 因此同一版本重新编译出的新构建号仍然算一致，不用每次出包都改配置
+- **精确值（填了 `expected`）**：两侧 trim 后完全相等才算通过。开关位是精确匹配而不是"不低于"，`wlan0BtSwitch` 读到 `1` 即使比 `0` 大也不合格。
 - 任一侧解析不出数字点分串时判为"无法比较"，按失败处理。
 
 每个配置段（以 `boxVersion` 为例，另两段同构）：
@@ -388,7 +390,8 @@ band.rightVersion
 |---|---|
 | `enabled` | 组件总开关，**默认 `true`**，盒子/眼镜/手环三段都默认校验；只在临时停用时置 `false` |
 | `checks[].field` | 要校验的字段名，取值见上表 |
-| `checks[].minVersion` | 要求的最低版本，写成 `0.5.0` 这样的 `x.y.z` 即可 |
+| `checks[].version` | 要求的版本号，写成 `0.5.2` 这样的 `x.y.z`；**必须完全一致**，高一点低一点都判失败 |
+| `checks[].minVersion` | 旧名字，等价于 `version`（必须一致），仅为兼容保留 |
 | `checks[].expected` | 要求的精确值，如 `wlan0BtSwitch` 配 `"0"`；填了它就不看 `minVersion` |
 | `checks[].enabled` | 单条规则的开关，便于临时停用一项而不是整段删掉 |
 | `checks[].blockOnFail` | 失败时是否阻断，默认 `true` |
@@ -399,9 +402,10 @@ band.rightVersion
 校验失败时：
 
 - 该组件置为 `Failed`（`blockOnFail=false` 时置 `Warning`，只提示不阻断），`Message` 带上逐项明细并以固定前缀 `版本校验未通过：` 开头，例如
-  `版本校验未通过：gen1App 版本 0.4.0 低于要求的最低版本 0.5.0`；
-- 失败项的值清空（与手环左右配对失效时的处理一致），让第 6 节的"必需字段非空"门禁一并拦住；
-- SN 类字段（`sn`、`leftSn`、`rightSn`）不清空，保证 `DeviceSerial`、左右配对判定与绑定关系不受影响；
+  `版本校验未通过：kernel 版本 v0.1.7-261002.012946-9e315c057 与要求的版本 0.1.6 不一致（高于）`；
+- **读到的值一律原样保留，不清空**。早期版本会把失败项清空，界面上显示成"未获取"，和真的没读到无法区分，
+  排查时极易误判（2026-10-07 换设备后那次就是被这个误导）；
+- 阻断改由第 6 节门禁直接判组件状态与校验前缀，不再依赖"必需字段非空"；
 - 进度条与界面提示同步显示未通过原因。
 
 某个组件采集本身已经失败时不再叠加校验结论，避免把"读不到"误报成"版本不合格"。
@@ -419,7 +423,10 @@ band.rightVersion
 此外还有两项不受 `requireCompleteVersionSet` 开关影响、失败时同样禁止预留 SN 与上报的校验：
 
 - 手环左右配对（一左一右、SN 互不相同）；
-- 版本配置校验（见 5.4，盒子/眼镜/手环各一个开关，默认全关；开启后版本低于配置的最低版本即阻断）。
+- 版本配置校验（见 5.4，盒子/眼镜/手环各一个开关，默认全开；版本与配置的不一致，或该字段读不到即阻断）。
+
+版本配置校验的阻断**直接判组件状态**（`State = Failed` 且 `Message` 带 `版本校验未通过：` 前缀），
+预留 SN 与上报各判一次，不依赖"必需字段为空"。`blockOnFail=false` 时组件只置 `Warning`，两处都放行。
 
 任何必需字段为空时：
 
@@ -522,25 +529,27 @@ POST /swiftmom/api/createRoute
 
 ```json
 {
-  "deviceSn": "D1S724V30W2631000004",
+  "deviceSn": "D1S0100V38W263900191",
   "box": {
-    "sn": "D1S724V30W2631000004",
-    "uboot": "v0.0.2-260824.095308-e4474f346",
-    "kernel": "v0.1.1-260903.050734-436e50b1d",
-    "rootfs": "0.0.5"
+    "sn": "D1S0100V38W263900191",
+    "uboot": "v0.1.1-261002.012924-9e315c057",
+    "kernel": "v0.1.7-261002.012946-9e315c057",
+    "rootfs": "0.1.7",
+    "gen1App": "0.5.2-20260929-65.e51ad76d",
+    "wlan0BtSwitch": "0"
   },
   "glasses": {
-    "sn": "D1V804V31W263200004",
-    "uboot": "V0.0.2-260822.141024-f7ee5ba46",
-    "kernel": "V0.0.5-260822.141034-f7ee5ba46",
-    "rootfs": "V0.0.4-260822.141051-f7ee5ba46",
-    "app": "V0.0.7-260822.141149-f7ee5ba46"
+    "sn": "D1V0100V38W263800043",
+    "uboot": "V0.0.2-260910.133246-1f5b58965",
+    "kernel": "V0.0.8-260910.133254-1f5b58965",
+    "rootfs": "V0.0.6-260910.133310-1f5b58965",
+    "app": "V0.1.1-260910.133351-1f5b58965"
   },
   "band": {
-    "leftSn": "V61S1.0-C62100000042326",
-    "leftVersion": "3.0.3.3",
-    "rightSn": "V61M1.0-C621000000412EA",
-    "rightVersion": "3.0.3.3"
+    "leftSn": "V61S1.0-F6380000932FECA",
+    "leftVersion": "3.0.3.6",
+    "rightSn": "V61S1.0-F638000086422F2",
+    "rightVersion": "3.0.3.6"
   }
 }
 ```
@@ -569,9 +578,16 @@ EXE所在目录\logs\packaging-station.log
 - SwiftMOM 每阶段 URL；
 - 脱敏后的请求 JSON；
 - HTTP 状态、`msgId`、`msgStr` 和脱敏后的响应 JSON；
+- **上报到 MES 的版本 JSON（createRoute 的 `rmk2`）**，单独一行以 `MES upload payload rmk2 pcbSeq=...` 记录，
+  内容与实际报上去的完全一致。整包里它是被转义过的嵌套字符串，混着看不清，
+  而"上报的版本对不对"是排查时最常问的，所以单独记一条；
 - 上传最终结果和异常堆栈。
 
 密码和 token 始终替换为 `***`，不得写入日志。
+
+日志里的 JSON 用宽松编码器输出，中文保持原文而不是 `\u5DE5` 这类转义，方便直接阅读。
+**只影响日志**，实际发送给 MES 的报文仍是标准 JSON（非 ASCII 按 `\uXXXX` 转义）。
+模拟模式（`mode: mock`）不真正上报，但同样把这份版本 JSON 记进日志，便于核对格式。
 
 ## 10. 常见故障定位
 

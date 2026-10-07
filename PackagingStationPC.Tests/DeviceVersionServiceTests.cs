@@ -79,9 +79,34 @@ public sealed class DeviceVersionServiceTests
         var box = snapshot.Components.First(item => item.Component == "box");
         Assert.Equal(QueryState.Failed, box.State);
         Assert.Contains("wlan0BtSwitch 当前为 1，要求为 0", box.Message, StringComparison.Ordinal);
-        // 开关位不合格时该字段清空，SN 不受影响。
-        Assert.Equal(string.Empty, box.Values[DeviceVersionService.SwitchField]);
+        // 不合格也保留读到的原值：清空会让界面显示"未获取"，和真的没读到无法区分。
+        Assert.Equal("1", box.Values[DeviceVersionService.SwitchField]);
         Assert.Equal("D1S0001V30W263200002", snapshot.DeviceSerial);
+    }
+
+    [Fact]
+    public async Task Collect_KeepsTheMeasuredValueWhenTheCheckFails()
+    {
+        // 不合格也保留读到的原值：以前会清空，界面显示"未获取"，和真的没读到无法区分。
+        var configuration = new AppConfiguration
+        {
+            BoxVersion = new VersionCheckConfiguration
+            {
+                Enabled = true,
+                Checks =
+                [
+                    new VersionCheckItem { Field = "kernel", Version = "9.9.9" },
+                    new VersionCheckItem { Field = DeviceVersionService.SwitchField, Expected = "0" }
+                ]
+            }
+        };
+
+        var snapshot = await CollectAsync(BoxOutputWithSwitch("1"), configuration);
+
+        var box = snapshot.Components.First(item => item.Component == "box");
+        Assert.Equal(QueryState.Failed, box.State);
+        Assert.Equal("v0.1.3-260909", box.Values["kernel"]);
+        Assert.Equal("1", box.Values[DeviceVersionService.SwitchField]);
     }
 
     [Fact]
@@ -135,14 +160,14 @@ public sealed class DeviceVersionServiceTests
     }
 
     [Fact]
-    public async Task Collect_FailsBoxWhenVersionIsBelowConfiguredMinimum()
+    public async Task Collect_FailsBoxWhenVersionDiffersFromTheConfiguredOne()
     {
         var configuration = new AppConfiguration
         {
             BoxVersion = new VersionCheckConfiguration
             {
                 Enabled = true,
-                Checks = [new VersionCheckItem { Field = "gen1App", MinVersion = "0.6.0" }]
+                Checks = [new VersionCheckItem { Field = "gen1App", Version = "0.6.0" }]
             }
         };
 
@@ -150,9 +175,9 @@ public sealed class DeviceVersionServiceTests
 
         var box = snapshot.Components.First(item => item.Component == "box");
         Assert.Equal(QueryState.Failed, box.State);
-        Assert.Contains("低于要求的最低版本 0.6.0", box.Message, StringComparison.Ordinal);
-        // 失败项的值被清空，让既有的"必需字段非空"门禁一并拦住。
-        Assert.Equal(string.Empty, box.Values["gen1App"]);
+        Assert.Contains("与要求的版本 0.6.0 不一致（低于）", box.Message, StringComparison.Ordinal);
+        // 值原样保留，阻断交给门禁看组件状态，不再靠清空值。
+        Assert.Equal("0.5.0-20260920-36.3dc2a236", box.Values["gen1App"]);
         // 校验只针对版本字段，产品 SN 与其余链路不受影响。
         Assert.Equal("D1S0001V30W263200002", snapshot.DeviceSerial);
         Assert.Equal(QueryState.Success, snapshot.Components.First(item => item.Component == "band").State);
@@ -166,7 +191,7 @@ public sealed class DeviceVersionServiceTests
             BoxVersion = new VersionCheckConfiguration
             {
                 Enabled = true,
-                Checks = [new VersionCheckItem { Field = "gen1App", MinVersion = "0.5.0" }]
+                Checks = [new VersionCheckItem { Field = "gen1App", Version = "0.5.0" }]
             }
         };
 
@@ -187,8 +212,8 @@ public sealed class DeviceVersionServiceTests
                 Enabled = true,
                 Checks =
                 [
-                    new VersionCheckItem { Field = "leftVersion", MinVersion = "1.0.0" },
-                    new VersionCheckItem { Field = "rightVersion", MinVersion = "2.0.0" }
+                    new VersionCheckItem { Field = "leftVersion", Version = "1.0.0" },
+                    new VersionCheckItem { Field = "rightVersion", Version = "2.0.0" }
                 ]
             }
         };
@@ -197,9 +222,9 @@ public sealed class DeviceVersionServiceTests
 
         var band = snapshot.Components.First(item => item.Component == "band");
         Assert.Equal(QueryState.Failed, band.State);
-        Assert.Contains("低于要求的最低版本 2.0.0", band.Message, StringComparison.Ordinal);
-        Assert.Equal(string.Empty, band.Values["rightVersion"]);
-        // 版本被清空，但左右 SN 保留，配对判定与 DeviceSerial 不受影响。
+        Assert.Contains("与要求的版本 2.0.0 不一致（低于）", band.Message, StringComparison.Ordinal);
+        Assert.Equal("1.0.0", band.Values["rightVersion"]);
+        // 版本保留，左右 SN 也保留，配对判定与 DeviceSerial 不受影响。
         Assert.Equal("V61S1.0-LEFT", band.Values["leftSn"]);
         Assert.Equal("V61S1.0-RIGHT", band.Values["rightSn"]);
         // 手环配置段不会影响盒子。
@@ -215,12 +240,12 @@ public sealed class DeviceVersionServiceTests
             GlassesVersion = new VersionCheckConfiguration
             {
                 Enabled = false,
-                Checks = [new VersionCheckItem { Field = "app", MinVersion = "9.9.9" }]
+                Checks = [new VersionCheckItem { Field = "app", Version = "9.9.9" }]
             },
             BoxVersion = new VersionCheckConfiguration
             {
                 Enabled = true,
-                Checks = [new VersionCheckItem { Field = "kernel", MinVersion = "9.9.9" }]
+                Checks = [new VersionCheckItem { Field = "kernel", Version = "9.9.9" }]
             }
         };
 
@@ -244,8 +269,8 @@ public sealed class DeviceVersionServiceTests
                 Enabled = true,
                 Checks =
                 [
-                    new VersionCheckItem { Field = "leftVersion", MinVersion = "3.0.3.6", AllowMissing = false },
-                    new VersionCheckItem { Field = "rightVersion", MinVersion = "3.0.3.6", AllowMissing = false }
+                    new VersionCheckItem { Field = "leftVersion", Version = "3.0.3.6", AllowMissing = false },
+                    new VersionCheckItem { Field = "rightVersion", Version = "3.0.3.6", AllowMissing = false }
                 ]
             }
         };
@@ -268,7 +293,7 @@ public sealed class DeviceVersionServiceTests
             BandVersion = new VersionCheckConfiguration
             {
                 Enabled = true,
-                Checks = [new VersionCheckItem { Field = "leftVersion", MinVersion = "3.0.3.6", AllowMissing = true }]
+                Checks = [new VersionCheckItem { Field = "leftVersion", Version = "3.0.3.6", AllowMissing = true }]
             }
         };
 

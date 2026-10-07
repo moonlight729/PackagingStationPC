@@ -9,6 +9,55 @@ namespace PackagingStationPC.Tests;
 public sealed class SwiftMomFactoryUploadServiceTests
 {
     [Fact]
+    public async Task Upload_LogsTheVersionPayloadThatGoesToMes()
+    {
+        var handler = new RecordingHandler(
+            JsonResponse("""{"msgId":0,"msgStr":"ok","token":"token-123"}"""),
+            JsonResponse("""{"msgId":"0","msgStr":"check ok"}"""),
+            JsonResponse("""{"msgId":0,"msgStr":"create ok"}"""));
+        using var client = new HttpClient(handler);
+        using var service = new SwiftMomFactoryUploadService(Configuration(), client, logger: Logger(out var logPath));
+        try
+        {
+            Assert.True((await service.UploadAsync(Record())).Success);
+
+            var log = await File.ReadAllTextAsync(logPath);
+            // 版本快照单独一条，不被转义淹没在整包里。
+            Assert.Contains("MES upload payload rmk2 pcbSeq=G1F2632000001", log, StringComparison.Ordinal);
+            Assert.Contains("\"deviceSn\":\"device-001\"", log, StringComparison.Ordinal);
+            Assert.Contains(
+                "\"app\":\"V0.0.7-260822.141149-f7ee5ba46\"",
+                log,
+                StringComparison.Ordinal);
+            Assert.Contains("\"leftVersion\":\"3.0.3.3\"", log, StringComparison.Ordinal);
+            // createRoute 的整包也要在，便于对照 MES 侧收到什么。
+            Assert.Contains("SwiftMOM request stage=createRoute", log, StringComparison.Ordinal);
+        }
+        finally
+        {
+            File.Delete(logPath);
+        }
+    }
+
+    [Fact]
+    public async Task Mock_LogsTheVersionPayloadItWouldUpload()
+    {
+        var service = new MockFactoryUploadService(Logger(out var logPath));
+        try
+        {
+            await service.UploadAsync(Record());
+
+            var log = await File.ReadAllTextAsync(logPath);
+            Assert.Contains("未真正上报", log, StringComparison.Ordinal);
+            Assert.Contains("\"deviceSn\":\"device-001\"", log, StringComparison.Ordinal);
+        }
+        finally
+        {
+            File.Delete(logPath);
+        }
+    }
+
+    [Fact]
     public async Task Upload_PerformsLoginCheckAndCreateRouteInOrder()
     {
         var handler = new RecordingHandler(
@@ -91,6 +140,13 @@ public sealed class SwiftMomFactoryUploadServiceTests
         Assert.True(result.Success, result.Message);
         Assert.Single(handler.Requests);
         Assert.Equal("/swiftmom/api/clientLogin", handler.Requests[0].Uri.AbsolutePath);
+    }
+
+    /// <summary>记录到临时文件的日志器，用来断言真正写进 logs/packaging-station.log 的内容。</summary>
+    private static AppLogger Logger(out string path)
+    {
+        path = Path.Combine(Path.GetTempPath(), $"mes-{Guid.NewGuid():N}.log");
+        return new AppLogger(path);
     }
 
     private static FactorySystemConfiguration Configuration() => new()

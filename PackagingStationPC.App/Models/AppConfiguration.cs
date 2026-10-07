@@ -68,7 +68,7 @@ public sealed class WorkflowConfiguration
 
 /// <summary>
 /// 单个组件的版本配置校验。这是一个独立于采集的动作：等全部版本号都读完之后，
-/// 再把该组件读到的版本逐项与这里配置的最低版本比对。
+/// 再把该组件读到的版本逐项与这里配置的要求版本比对，必须完全一致。
 /// </summary>
 public sealed class VersionCheckConfiguration
 {
@@ -88,12 +88,22 @@ public sealed class VersionCheckItem
     /// </summary>
     public string Field { get; set; } = string.Empty;
 
-    /// <summary>要求的最低版本，写成 <c>0.5.0</c> 这样的 <c>x.y.z</c>；比较时忽略前导 v/V 与 "-" 之后的构建信息。</summary>
+    /// <summary>
+    /// 要求的版本号，**必须完全一致**：写 <c>0.5.2</c> 就只认 0.5.2，比它高或比它低都判失败。
+    /// 比较时忽略前导 v/V 与第一段之后的构建信息，<c>v0.1.6-260920.053745-289545544</c> 按 <c>0.1.6</c> 比，
+    /// 所以同一版本重新编译出的新构建号仍然算一致。
+    /// </summary>
+    public string Version { get; set; } = string.Empty;
+
+    /// <summary>
+    /// 旧配置里 <c>minVersion</c> 的兼容别名，语义已与 <see cref="Version"/> 相同（必须一致），不再是最低版本。
+    /// 两个都填时以 <see cref="Version"/> 为准。
+    /// </summary>
     public string MinVersion { get; set; } = string.Empty;
 
     /// <summary>
     /// 要求的精确值（trim 后完全相等），用于版本之外的开关位、配置项，例如 <c>wlan0BtSwitch</c> 要求为 <c>0</c>。
-    /// 填了它就按相等比较，<see cref="MinVersion"/> 不再参与；两个都不填则该项跳过。
+    /// 填了它就按字面相等比较，<see cref="Version"/> 不再参与；两个都不填则该项跳过。
     /// </summary>
     public string Expected { get; set; } = string.Empty;
 

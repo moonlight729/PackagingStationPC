@@ -1,5 +1,6 @@
 using System.Net.Http;
 using System.Net.Http.Json;
+using System.Text.Encodings.Web;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using PackagingStationPC.Models;
@@ -7,6 +8,48 @@ using PackagingStationPC.Models;
 namespace PackagingStationPC.Services;
 
 public sealed record FactoryUploadProgress(string Stage, string State, string Message);
+
+/// <summary>
+/// 上报 MES 的版本快照（createRoute 的 rmk2）。swiftmom 真正发送它，mock 与日志也都用它，
+/// 保证"日志里看到的"和"实际报上去的"是同一份内容。
+/// </summary>
+internal static class FactoryVersionJson
+{
+    public static string Create(ProductionRecord record)
+    {
+        var versions = new Dictionary<string, object>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["deviceSn"] = record.DeviceSerial
+        };
+        foreach (var component in record.VersionSnapshot.Components.Where(component =>
+                     component.Component is "box" or "glasses" or "band"))
+        {
+            versions[component.Component] = new Dictionary<string, string>(
+                component.Values,
+                StringComparer.OrdinalIgnoreCase);
+        }
+
+        return JsonSerializer.Serialize(versions, JsonSerializerOptions.Web);
+    }
+
+    /// <summary>同一份 JSON 的可读版本：默认编码器会把中文输出成 \u5DE5 这种转义，日志里没法看。</summary>
+    public static string CreateReadable(ProductionRecord record)
+    {
+        try
+        {
+            return JsonNode.Parse(Create(record))?.ToJsonString(ReadableOptions) ?? Create(record);
+        }
+        catch (JsonException)
+        {
+            return Create(record);
+        }
+    }
+
+    internal static readonly JsonSerializerOptions ReadableOptions = new(JsonSerializerDefaults.Web)
+    {
+        Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping
+    };
+}
 
 public interface IFactoryUploadService
 {
@@ -18,8 +61,11 @@ public interface IFactoryUploadService
 
 public sealed class MockFactoryUploadService : IFactoryUploadService
 {
+    private readonly AppLogger? _logger;
     public event Action<FactoryUploadProgress>? ProgressChanged;
     public string Mode => "mock";
+
+    public MockFactoryUploadService(AppLogger? logger = null) => _logger = logger;
 
     public async Task<IntegrationResult> TestConnectionAsync(CancellationToken cancellationToken = default)
     {
@@ -31,6 +77,11 @@ public sealed class MockFactoryUploadService : IFactoryUploadService
         ProductionRecord record,
         CancellationToken cancellationToken = default)
     {
+        // 模拟模式不真正上报，但仍把将要报上去的版本 JSON 记下来，方便核对内容与格式。
+        await LogAsync(
+            "INFO",
+            $"MES upload payload (mock, 未真正上报) pcbSeq={record.PackageSn}, rmk2={FactoryVersionJson.CreateReadable(record)}");
+
         foreach (var stage in new[] { "clientLogin", "checkRoute", "createRoute" })
         {
             ProgressChanged?.Invoke(new FactoryUploadProgress(stage, "Running", "执行中"));
@@ -39,6 +90,9 @@ public sealed class MockFactoryUploadService : IFactoryUploadService
         }
         return new IntegrationResult(true, $"模拟上传成功: {record.PackageSn}", "{\"accepted\":true}");
     }
+
+    private Task LogAsync(string level, string message) =>
+        _logger?.WriteAsync(level, message) ?? Task.CompletedTask;
 }
 
 public sealed class SwiftMomFactoryUploadService : IFactoryUploadService, IDisposable
@@ -146,8 +200,12 @@ public sealed class SwiftMomFactoryUploadService : IFactoryUploadService, IDispo
             }
 
             activeStage = "createRoute";
-            var createPayload = CreateRoutePayload(record);
+            var rmk2 = FactoryVersionJson.Create(record);
+            var createPayload = CreateRoutePayload(record, rmk2);
             await LogRequestAsync("createRoute", _configuration.CreateRoutePath, createPayload);
+            // 版本快照单独再打一条：整包里它是被转义过的嵌套字符串，混在里面没法读，
+            // 而这正是排查"上报的版本对不对"时唯一要看的内容。
+            await LogAsync("INFO", $"MES upload payload rmk2 pcbSeq={record.PackageSn}: {FactoryVersionJson.CreateReadable(record)}");
             Report("createRoute", "Running", "正在写入过站记录");
             var create = await PostAsync(
                 _configuration.CreateRoutePath,
@@ -203,7 +261,7 @@ public sealed class SwiftMomFactoryUploadService : IFactoryUploadService, IDispo
         token: null,
         cancellationToken);
 
-    private object CreateRoutePayload(ProductionRecord record) => new
+    private object CreateRoutePayload(ProductionRecord record, string rmk2) => new
     {
         pcbSeq = record.PackageSn,
         prodNo = _configuration.ProdNo,
@@ -215,28 +273,11 @@ public sealed class SwiftMomFactoryUploadService : IFactoryUploadService, IDispo
         weight = 0d,
         packNo = string.Empty,
         rmk1 = string.Empty,
-        rmk2 = CreateVersionString(record),
+        rmk2 = rmk2,
         rmk3 = string.Empty,
         rmk4 = string.Empty,
         testDetail = Array.Empty<object>()
     };
-
-    private static string CreateVersionString(ProductionRecord record)
-    {
-        var versions = new Dictionary<string, object>(StringComparer.OrdinalIgnoreCase)
-        {
-            ["deviceSn"] = record.DeviceSerial
-        };
-        foreach (var component in record.VersionSnapshot.Components.Where(component =>
-                     component.Component is "box" or "glasses" or "band"))
-        {
-            versions[component.Component] = new Dictionary<string, string>(
-                component.Values,
-                StringComparer.OrdinalIgnoreCase);
-        }
-
-        return JsonSerializer.Serialize(versions, JsonOptions);
-    }
 
     private async Task<SwiftMomResponse> PostAsync(
         string path,
@@ -325,7 +366,7 @@ public sealed class SwiftMomFactoryUploadService : IFactoryUploadService, IDispo
 
     private Task LogRequestAsync(string stage, string path, object payload) => LogAsync(
         "INFO",
-        $"SwiftMOM request stage={stage}, url={new Uri(_httpClient.BaseAddress!, path.TrimStart('/'))}, body={JsonSerializer.Serialize(payload, JsonOptions)}");
+        $"SwiftMOM request stage={stage}, url={new Uri(_httpClient.BaseAddress!, path.TrimStart('/'))}, body={JsonSerializer.Serialize(payload, FactoryVersionJson.ReadableOptions)}");
 
     private Task LogStageAsync(string stage, SwiftMomResponse response) => LogAsync(
         response.IsMesSuccess ? "INFO" : "ERROR",
@@ -341,7 +382,7 @@ public sealed class SwiftMomFactoryUploadService : IFactoryUploadService, IDispo
                 value["token"] = "***";
             }
 
-            var sanitized = node?.ToJsonString(JsonOptions) ?? body;
+            var sanitized = node?.ToJsonString(FactoryVersionJson.ReadableOptions) ?? body;
             return string.IsNullOrWhiteSpace(token) ? sanitized : sanitized.Replace(token, "***", StringComparison.Ordinal);
         }
         catch (JsonException)
@@ -401,5 +442,5 @@ public static class FactoryUploadServiceFactory
     public static IFactoryUploadService Create(FactorySystemConfiguration configuration, AppLogger? logger = null) =>
         string.Equals(configuration.Mode, "swiftmom", StringComparison.OrdinalIgnoreCase)
             ? new SwiftMomFactoryUploadService(configuration, logger: logger)
-            : new MockFactoryUploadService();
+            : new MockFactoryUploadService(logger);
 }

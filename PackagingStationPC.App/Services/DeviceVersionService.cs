@@ -125,15 +125,9 @@ public sealed class DeviceVersionService
                 continue;
             }
 
-            // 失败项的值清空（与手环左右配对失效时的处理一致），让既有的"必需字段非空"门禁
-            // 一起拦住，避免带着不合格的版本继续绑定和上报；
-            // SN 类字段不清空，保证 DeviceSerial 与绑定关系始终可用。
-            var values = new Dictionary<string, string>(component.Values, StringComparer.OrdinalIgnoreCase);
-            foreach (var field in result.Fields.Where(field => values.ContainsKey(field) && !IsSerialField(field)))
-            {
-                values[field] = string.Empty;
-            }
-
+            // 读到的值一律原样保留：以前会把失败项清空，界面上就显示成"未获取"，
+            // 和真的没读到无法区分（2026-10-07 那次排查就被这个误导了）。
+            // 阻断改由门禁看组件 State 与校验明细负责，不再靠清空值。
             var message = $"{VersionChecker.FailurePrefix}{result.Message}";
             components[index] = new VersionComponentResult
             {
@@ -143,7 +137,7 @@ public sealed class DeviceVersionService
                 State = result.Blocking ? QueryState.Failed : QueryState.Warning,
                 Source = component.Source,
                 Message = message,
-                Values = values
+                Values = component.Values
             };
 
             ProgressChanged?.Invoke($"{component.DisplayName}{message}");
@@ -157,11 +151,6 @@ public sealed class DeviceVersionService
         "band" => _bandVersion,
         _ => null
     };
-
-    private static bool IsSerialField(string field) =>
-        field.Equals("sn", StringComparison.OrdinalIgnoreCase) ||
-        field.Equals("leftSn", StringComparison.OrdinalIgnoreCase) ||
-        field.Equals("rightSn", StringComparison.OrdinalIgnoreCase);
 
     private async Task<VersionComponentResult> QueryBoxAsync(
         string serial,

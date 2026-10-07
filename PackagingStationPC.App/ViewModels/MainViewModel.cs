@@ -367,10 +367,12 @@ public sealed class MainViewModel : ObservableObject
         var missing = new List<string>();
         var box = snapshot.Components.FirstOrDefault(item => item.Component == "box");
         Require(box, "盒子", "sn", "uboot", "kernel", "rootfs", "gen1App");
-        // 版本读到了但没通过配置的最低版本校验时，字段值被清空，上面的 Require 只会报"缺失"，
-        // 这里把校验明细补进去；盒子、眼镜、手环只要有任一组件没过校验就一律阻断，
-        // 不让不合格的版本绑定和上报。读取失败（没有这个前缀）不在这里重复报。
+        // 版本配置校验的明细：值不再被清空，Require 查不到"缺失"，只能靠这里报。
+        // 盒子、眼镜、手环只要有任一组件的校验没过就一律阻断，不让不合格的版本上报。
+        // blockOnFail=false 时组件只置 Warning，这里按"只提示不阻断"放行。
+        // 采集本身失败（没有这个前缀）不在这里重复报。
         foreach (var component in snapshot.Components.Where(item =>
+                     item.State is QueryState.Failed &&
                      item.Message.StartsWith(VersionChecker.FailurePrefix, StringComparison.Ordinal)))
         {
             missing.Add($"{component.DisplayName}.{component.Message}");
@@ -525,6 +527,17 @@ public sealed class MainViewModel : ObservableObject
         if (_configuration.Adb.RequireCompleteVersionSet && !_snapshot.IsComplete)
         {
             throw new InvalidOperationException("必需版本项不完整，不能预留 SN。");
+        }
+
+        // 版本配置校验是硬约束，和左右手环配对一样不受 requireCompleteVersionSet 开关影响。
+        // 以前靠"清空失败项的值 → 必需字段非空"间接拦住，现在值不再清空，改为直接判组件状态。
+        var failedCheck = _snapshot.Components.FirstOrDefault(item =>
+            item.State is QueryState.Failed &&
+            item.Message.StartsWith(VersionChecker.FailurePrefix, StringComparison.Ordinal));
+        if (failedCheck is not null)
+        {
+            throw new InvalidOperationException(
+                $"{failedCheck.DisplayName}版本校验未通过，不能预留 SN：{failedCheck.Message}");
         }
 
         // 左右手环配对是硬约束，不受 requireCompleteVersionSet 开关影响。

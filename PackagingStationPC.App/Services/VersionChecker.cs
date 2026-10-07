@@ -31,14 +31,17 @@ public static class VersionChecker
                 continue;
             }
 
-            // 期望值和最低版本都没配就没有判断依据，跳过这一项而不是误判失败。
-            if (string.IsNullOrWhiteSpace(check.Expected) && string.IsNullOrWhiteSpace(check.MinVersion))
+            var field = check.Field.Trim();
+            var expected = check.Expected.Trim();
+            // minVersion 是旧配置里的名字，语义已经和 version 一样，只作兼容读取。
+            var required = string.IsNullOrWhiteSpace(check.Version) ? check.MinVersion.Trim() : check.Version.Trim();
+
+            // 期望值和版本号都没配就没有判断依据，跳过这一项而不是误判失败。
+            if (expected.Length == 0 && required.Length == 0)
             {
                 continue;
             }
 
-            var field = check.Field.Trim();
-            var expected = check.Expected.Trim();
             var actual = component.Values.GetValueOrDefault(field);
             if (string.IsNullOrWhiteSpace(actual))
             {
@@ -50,11 +53,11 @@ public static class VersionChecker
                 failures.Add(new VersionCheckFailure(
                     field,
                     check.BlockOnFail,
-                    $"{field} 未读取到，无法校验（{DescribeRequirement(expected, check.MinVersion)}）"));
+                    $"{field} 未读取到，无法校验（{DescribeRequirement(expected.Length > 0 ? expected : required)}）"));
                 continue;
             }
 
-            // 配了期望值就按精确相等比较（开关位、配置项这类非版本字段），否则按最低版本比对。
+            // 配了期望值就按字面精确相等比较（开关位、配置项这类非版本字段）。
             if (expected.Length > 0)
             {
                 if (!string.Equals(actual.Trim(), expected, StringComparison.Ordinal))
@@ -62,36 +65,36 @@ public static class VersionChecker
                     failures.Add(new VersionCheckFailure(
                         field,
                         check.BlockOnFail,
-                        $"{field} 当前为 {actual.Trim()}，{DescribeRequirement(expected, check.MinVersion)}"));
+                        $"{field} 当前为 {actual.Trim()}，{DescribeRequirement(expected)}"));
                 }
 
                 continue;
             }
 
-            var comparison = CompareVersion(actual, check.MinVersion);
+            var comparison = CompareVersion(actual, required);
             if (comparison is null)
             {
                 failures.Add(new VersionCheckFailure(
                     field,
                     check.BlockOnFail,
-                    $"{field} 版本 {actual} 无法与配置的最低版本 {check.MinVersion} 比较"));
+                    $"{field} 版本 {actual} 无法与要求的版本 {required} 比较"));
                 continue;
             }
 
-            if (comparison < 0)
+            // 版本必须完全一致：比要求的高同样算不合格，避免现场跑着没验证过的固件。
+            if (comparison != 0)
             {
                 failures.Add(new VersionCheckFailure(
                     field,
                     check.BlockOnFail,
-                    $"{field} 版本 {actual} 低于要求的最低版本 {check.MinVersion}"));
+                    $"{field} 版本 {actual} 与要求的版本 {required} 不一致（{(comparison < 0 ? "低于" : "高于")}）"));
             }
         }
 
         return failures.Count == 0 ? VersionCheckResult.Pass() : new VersionCheckResult(failures);
     }
 
-    private static string DescribeRequirement(string expected, string minVersion) =>
-        expected.Length > 0 ? $"要求为 {expected}" : $"要求 >= {minVersion}";
+    private static string DescribeRequirement(string requirement) => $"要求为 {requirement}";
 
     /// <summary>
     /// 比较版本号：只按 <c>x.y.z</c> 这样的数字点分串比较，忽略前导 <c>v</c>/<c>V</c>
