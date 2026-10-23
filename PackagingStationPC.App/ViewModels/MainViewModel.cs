@@ -26,6 +26,7 @@ public sealed class MainViewModel : ObservableObject
     private bool _moduleHasError;
     private string _scannerInput = string.Empty;
     private string _scannedPackageCode = string.Empty;
+    private string _deviceActionsHint = "本轮尚未执行设备动作";
     private string _loginStageStatus = "等待上传";
     private string _checkRouteStageStatus = "等待上传";
     private string _createRouteStageStatus = "等待上传";
@@ -110,7 +111,15 @@ public sealed class MainViewModel : ObservableObject
 
     public ObservableCollection<AdbDeviceInfo> Devices { get; } = [];
     public ObservableCollection<VersionRowViewModel> VersionRows { get; } = [];
+    public ObservableCollection<DeviceActionRowViewModel> DeviceActions { get; } = [];
     public ObservableCollection<ProductionRecord> RecentRecords { get; } = [];
+
+    /// <summary>还没执行过设备动作时的占位提示（例如刚开机或刚点"下一台"）。</summary>
+    public string DeviceActionsHint
+    {
+        get => _deviceActionsHint;
+        private set => SetProperty(ref _deviceActionsHint, value);
+    }
 
     public AdbDeviceInfo? SelectedDevice
     {
@@ -328,6 +337,8 @@ public sealed class MainViewModel : ObservableObject
         _snapshot = null;
         ScannedPackageCode = string.Empty;
         VersionRows.Clear();
+        DeviceActions.Clear();
+        DeviceActionsHint = "本轮尚未执行设备动作";
         ModuleMessage = string.Empty;
         ModuleHasError = false;
         LoginStageStatus = "等待上传";
@@ -362,20 +373,20 @@ public sealed class MainViewModel : ObservableObject
         }
     }
 
-    private static string? ValidateForUpload(DeviceVersionSnapshot snapshot)
+    internal static string? ValidateForUpload(DeviceVersionSnapshot snapshot)
     {
         var missing = new List<string>();
         var box = snapshot.Components.FirstOrDefault(item => item.Component == "box");
         Require(box, "盒子", "sn", "uboot", "kernel", "rootfs", "gen1App");
-        // 版本配置校验的明细：值不再被清空，Require 查不到"缺失"，只能靠这里报。
-        // 盒子、眼镜、手环只要有任一组件的校验没过就一律阻断，不让不合格的版本上报。
-        // blockOnFail=false 时组件只置 Warning，这里按"只提示不阻断"放行。
-        // 采集本身失败（没有这个前缀）不在这里重复报。
-        foreach (var component in snapshot.Components.Where(item =>
-                     item.State is QueryState.Failed &&
-                     item.Message.StartsWith(VersionChecker.FailurePrefix, StringComparison.Ordinal)))
+        // 组件判失败就一律阻断：值不再被清空，Require 查不到"缺失"，只能靠这里报。
+        // 覆盖三种失败：读取失败（读不到值）、版本校验未通过、
+        // 以及采集时顺带执行的设备动作（例如写 LAN MAC）没做成——动作没做成就不能往下包装。
+        // blockOnFail=false 的校验项只把组件置 Warning，这里按"只提示不阻断"放行。
+        foreach (var component in snapshot.Components.Where(item => item.State is QueryState.Failed))
         {
-            missing.Add($"{component.DisplayName}.{component.Message}");
+            missing.Add(string.IsNullOrWhiteSpace(component.Message)
+                ? $"{component.DisplayName}.采集失败"
+                : $"{component.DisplayName}.{component.Message}");
         }
 
         var glasses = snapshot.Components.FirstOrDefault(item => item.Component == "glasses");
@@ -423,6 +434,7 @@ public sealed class MainViewModel : ObservableObject
     {
         _snapshot = await _versionService.CollectAsync(SelectedDevice?.Serial);
         VersionRows.Clear();
+        DeviceActions.Clear();
         foreach (var component in _snapshot.Components)
         {
             if (component.Values.Count == 0)
@@ -461,7 +473,24 @@ public sealed class MainViewModel : ObservableObject
             await _logger.WriteAsync(
                 component.State is QueryState.Success ? "INFO" : "ERROR",
                 $"Version component={component.Component}, state={component.State}, values={values}, source={component.Source}, message={component.Message}");
+
+            // 设备动作（写 LAN MAC 这类）：不是采集字段，不进上报，只在界面上和日志里留痕。
+            foreach (var action in component.Actions)
+            {
+                DeviceActions.Add(new DeviceActionRowViewModel(
+                    action.DisplayName,
+                    action.Success ? "成功" : "失败",
+                    action.Success ? "#087F75" : "#B42318",
+                    action.Command,
+                    action.Message));
+                await _logger.WriteAsync(
+                    action.Success ? "INFO" : "ERROR",
+                    $"Device action component={component.Component}, key={action.Key}, command={action.Command}, success={action.Success}, message={action.Message}");
+            }
         }
+
+        // 采过一轮却一条动作都没有，和"还没开始"是两回事，分开写免得排查时误判。
+        DeviceActionsHint = DeviceActions.Count == 0 ? "本轮没有设备动作记录" : string.Empty;
         await _logger.WriteAsync(
             "INFO",
             $"Version query device={_snapshot.AdbSerial}, complete={_snapshot.IsComplete}, app={BuildVersion.Display}");

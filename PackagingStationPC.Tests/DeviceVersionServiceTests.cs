@@ -10,6 +10,8 @@ public sealed class DeviceVersionServiceTests
         "[Debug] vendor_storage_read id = 1\n" +
         "[INFO] VENDOR_SN_ID:D1S0001V30W263200002\n" +
         "__BOX_SN_RC__=0\n" +
+        "[INFO] VENDOR_LAN_MAC_ID write ok\n" +
+        "__BOX_MAC_RC__=0\n" +
         "uboot version:  v0.0.8-260909\n" +
         "kernel version: v0.1.3-260909\n" +
         "rootfs version: 0.1.5\n" +
@@ -52,6 +54,57 @@ public sealed class DeviceVersionServiceTests
         Assert.Equal(QueryState.Success, box.State);
         Assert.Equal("D1S0001V30W263200002", box.Values["sn"]);
         Assert.Equal(string.Empty, box.Values[DeviceVersionService.SwitchField]);
+    }
+
+    [Fact]
+    public async Task Collect_RandomizesLanMacBeforeReadingVersion()
+    {
+        var run = await RunAsync(BoxOutputWithSwitch("1"));
+
+        var box = run.Snapshot.Components.First(item => item.Component == "box");
+        Assert.Equal(QueryState.Success, box.State);
+        var shell = run.Runner.Commands.First(command => command.Contains("vendor_storage", StringComparison.Ordinal));
+        var writeIndex = shell.IndexOf("vendor_storage -w VENDOR_LAN_MAC_ID -i \"00\"", StringComparison.Ordinal);
+        var versionIndex = shell.IndexOf("version 2>&1", StringComparison.Ordinal);
+        Assert.True(writeIndex >= 0, "盒子脚本里没有写 VENDOR_LAN_MAC_ID 的动作。");
+        Assert.True(writeIndex < versionIndex, "LAN MAC 随机化必须在读版本号之前执行。");
+        // 只写不读：MAC 不进采集结果，也就不可能进上报。
+        Assert.DoesNotContain(box.Values.Keys, key => key.Contains("mac", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public async Task Collect_FailsBoxWhenTheLanMacWriteFails()
+    {
+        // 写 LAN MAC 没做成就判盒子不合格，卡住后面的预留 SN 与上传；
+        // 读到的 SN 和版本仍然保留，界面上看得到读到了什么。
+        var run = await RunAsync(BoxOutputWithSwitch("1").Replace("__BOX_MAC_RC__=0", "__BOX_MAC_RC__=1"));
+
+        var box = run.Snapshot.Components.First(item => item.Component == "box");
+        Assert.Equal(QueryState.Failed, box.State);
+        Assert.Contains("写入盒子 LAN MAC 随机标记失败", box.Message, StringComparison.Ordinal);
+        Assert.Equal("D1S0001V30W263200002", box.Values["sn"]);
+        Assert.Equal("v0.1.3-260909", box.Values["kernel"]);
+        // 版本校验不再叠加到已经失败的组件上，避免把"动作没做成"误报成"版本不合格"。
+        Assert.DoesNotContain(VersionChecker.FailurePrefix, box.Message, StringComparison.Ordinal);
+
+        var action = Assert.Single(box.Actions);
+        Assert.False(action.Success);
+        Assert.Equal(DeviceVersionService.LanMacActionKey, action.Key);
+    }
+
+    [Fact]
+    public async Task Collect_RecordsTheLanMacActionWhenItSucceeds()
+    {
+        var snapshot = await CollectAsync(BoxOutputWithSwitch("1"));
+
+        var box = snapshot.Components.First(item => item.Component == "box");
+        Assert.Equal(QueryState.Success, box.State);
+        var action = Assert.Single(box.Actions);
+        Assert.True(action.Success);
+        Assert.Equal("LAN MAC 随机化", action.DisplayName);
+        Assert.Contains("vendor_storage -w VENDOR_LAN_MAC_ID", action.Command, StringComparison.Ordinal);
+        // 动作只留痕，不进采集字段（也就不会进上报）。
+        Assert.DoesNotContain(box.Values.Keys, key => key.Contains("mac", StringComparison.OrdinalIgnoreCase));
     }
 
     [Fact]
@@ -178,6 +231,9 @@ public sealed class DeviceVersionServiceTests
         Assert.Contains("与要求的版本 0.6.0 不一致（低于）", box.Message, StringComparison.Ordinal);
         // 值原样保留，阻断交给门禁看组件状态，不再靠清空值。
         Assert.Equal("0.5.0-20260920-36.3dc2a236", box.Values["gen1App"]);
+        // 设备动作是采集时已经做过的事：版本校验替换组件对象时不能把它丢掉，
+        // 否则界面上的"设备动作"卡片会显示成"本轮没有设备动作记录"。
+        Assert.Single(box.Actions);
         // 校验只针对版本字段，产品 SN 与其余链路不受影响。
         Assert.Equal("D1S0001V30W263200002", snapshot.DeviceSerial);
         Assert.Equal(QueryState.Success, snapshot.Components.First(item => item.Component == "band").State);
@@ -309,6 +365,13 @@ public sealed class DeviceVersionServiceTests
     private static async Task<DeviceVersionSnapshot> CollectAsync(
         string boxOutput,
         AppConfiguration? configuration = null,
+        bool includeBandVersions = true) =>
+        (await RunAsync(boxOutput, configuration, includeBandVersions)).Snapshot;
+
+    /// <summary>跑一轮采集并留下 adb 命令与进度文本，供断言脚本内容和提示信息用。</summary>
+    private static async Task<CollectRun> RunAsync(
+        string boxOutput,
+        AppConfiguration? configuration = null,
         bool includeBandVersions = true)
     {
         var runner = new RoutingProcessRunner()
@@ -317,14 +380,22 @@ public sealed class DeviceVersionServiceTests
             .On("base64 -d", () => new ProcessResult(0, "__ACM_RDY__=0", string.Empty, false))
             .On("python3", () => new ProcessResult(0, "__ACM_PORT__=/dev/cam0_acm1", string.Empty, false));
         var adb = new AdbClient(new AdbConfiguration { Path = "adb" }, runner);
+        var progress = new List<string>();
         var service = new DeviceVersionService(
             adb,
             new StubBandService { IncludeVersions = includeBandVersions },
             new GlassesAcmService(adb),
             configuration);
+        service.ProgressChanged += progress.Add;
 
-        return await service.CollectAsync("adb-001");
+        var snapshot = await service.CollectAsync("adb-001");
+        return new CollectRun(snapshot, runner, progress);
     }
+
+    private sealed record CollectRun(
+        DeviceVersionSnapshot Snapshot,
+        RoutingProcessRunner Runner,
+        List<string> Progress);
 
     private sealed class StubBandService : IBandSerialVersionService
     {

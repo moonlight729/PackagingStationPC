@@ -10,16 +10,17 @@ namespace PackagingStationPC.Services;
 public sealed class DeviceVersionService
 {
     private const string SnExitMarker = "__BOX_SN_RC__=";
+    private const string MacExitMarker = "__BOX_MAC_RC__=";
     private const string VersionExitMarker = "__BOX_VER_RC__=";
     private const string AppExitMarker = "__BOX_APP_RC__=";
     private const string SwitchExitMarker = "__BOX_SW_RC__=";
 
-    // 段的顺序就是脚本中命令的顺序：SN、version、gen1-app、wlan0_bt_switch。
-    private static readonly string[] BoxSectionKeys = ["sn", "version", "app", "switch"];
+    // 段的顺序就是脚本中命令的顺序：SN、LAN MAC 随机化、version、gen1-app、wlan0_bt_switch。
+    private static readonly string[] BoxSectionKeys = ["sn", "mac", "version", "app", "switch"];
     private static readonly string[] BoxSectionMarkers =
-        [SnExitMarker, VersionExitMarker, AppExitMarker, SwitchExitMarker];
+        [SnExitMarker, MacExitMarker, VersionExitMarker, AppExitMarker, SwitchExitMarker];
 
-    // 合并后一条 shell 要跑完 vendor_storage、version、dpkg-query 和 cat，超时给到单次默认值的 1.5 倍。
+    // 合并后一条 shell 要跑完 vendor_storage 读 SN、vendor_storage 写 LAN MAC、version、dpkg-query 和 cat，超时给到单次默认值的 1.5 倍。
     private static readonly TimeSpan BoxShellTimeout = TimeSpan.FromSeconds(15);
 
     /// <summary>盒子上的蓝牙/无线切换开关配置文件，读到什么值由配置段决定。</summary>
@@ -27,6 +28,9 @@ public sealed class DeviceVersionService
 
     /// <summary>该开关值在采集结果里的字段名。</summary>
     public const string SwitchField = "wlan0BtSwitch";
+
+    /// <summary>"写 LAN MAC"这个动作在 <see cref="VersionComponentResult.Actions"/> 里的标识。</summary>
+    public const string LanMacActionKey = "lanMac";
 
     private readonly AdbClient _adbClient;
     private readonly IBandSerialVersionService _bandSerialVersionService;
@@ -137,7 +141,10 @@ public sealed class DeviceVersionService
                 State = result.Blocking ? QueryState.Failed : QueryState.Warning,
                 Source = component.Source,
                 Message = message,
-                Values = component.Values
+                Values = component.Values,
+                // 设备动作是采集时已经做过的事，校验只改判定，不能把执行记录一起丢掉，
+                // 否则界面上的"设备动作"卡片会因为版本校验失败而变空。
+                Actions = component.Actions
             };
 
             ProgressChanged?.Invoke($"{component.DisplayName}{message}");
@@ -156,14 +163,17 @@ public sealed class DeviceVersionService
         string serial,
         CancellationToken cancellationToken)
     {
-        // 单次 shell 取回 SN、version、gen1-app 版本和 wlan0_bt_switch 开关：
+        // 单次 shell 取回 SN、写 LAN MAC、version、gen1-app 版本和 wlan0_bt_switch 开关：
         // sudo 权限在脚本内自判（root 直接跑，非 root 走 sudo -n），
-        // 四条命令的分段与各自的退出码用标记行带回，省掉多次 adb 往返和一次权限探测。
+        // 五条命令的分段与各自的退出码用标记行带回，省掉多次 adb 往返和一次权限探测。
         // 注意：标记常量自身已以 '=' 结尾，脚本里写成 echo 标记$?，不能再补一个 '='。
         // dpkg-query 只查询包数据库，不需要 root。
         var script =
             "if [ \"$(id -u)\" = \"0\" ]; then SUDO=; else SUDO=\"sudo -n\"; fi; " +
             $"$SUDO vendor_storage -r VENDOR_SN_ID -t string 2>&1; echo {SnExitMarker}$?; " +
+            // 读版本号之前先随机化 LAN MAC：写入后盒子重启时会重新生成一个 MAC 地址。
+            // 只做写入动作，MAC 本身不回读、不进采集结果、也不上报。
+            $"$SUDO vendor_storage -w VENDOR_LAN_MAC_ID -i \"00\" 2>&1; echo {MacExitMarker}$?; " +
             $"version 2>&1; echo {VersionExitMarker}$?; " +
             $"dpkg-query -W gen1-app 2>&1; echo {AppExitMarker}$?; " +
             $"cat {SwitchConfigPath} 2>&1; echo {SwitchExitMarker}$?";
@@ -230,14 +240,35 @@ public sealed class DeviceVersionService
         // 免得一个配置项把整轮采集（连 SN 一起）拖成失败。
         values[SwitchField] = ReadFirstLine(sections["switch"]);
 
+        // 写 LAN MAC 是采集时顺带执行的动作（在读版本号之前）：MAC 本身不回读、不进 Values、也不上报，
+        // 但写失败直接判盒子不合格，卡住后面的预留 SN 与上传；读到的 SN 和版本仍然原样保留，
+        // 界面上看得到读到了什么，和"没读到"区分得开。
+        var macSection = sections["mac"];
+        var macOk = macSection.ExitCode == 0;
+        var macDetail = macOk ? "已执行，重启后生效" : Describe(macSection.Output, result);
+        ProgressChanged?.Invoke(
+            $"盒子 LAN MAC 随机化{(macOk ? "已写入，重启后生效" : $"写入失败: {macDetail}")}。");
+
         return new VersionComponentResult
         {
             Component = "box",
             DisplayName = "盒子",
             Required = true,
-            State = QueryState.Success,
-            Source = "adb shell: vendor_storage + version + dpkg-query + wlan0_bt_switch",
-            Values = values
+            State = macOk ? QueryState.Success : QueryState.Failed,
+            Message = macOk ? string.Empty : $"写入盒子 LAN MAC 随机标记失败: {macDetail}",
+            Source = "adb shell: vendor_storage(读SN/写LAN MAC) + version + dpkg-query + wlan0_bt_switch",
+            Values = values,
+            Actions =
+            [
+                new DeviceActionResult
+                {
+                    Key = LanMacActionKey,
+                    DisplayName = "LAN MAC 随机化",
+                    Command = "vendor_storage -w VENDOR_LAN_MAC_ID -i \"00\"",
+                    Success = macOk,
+                    Message = macDetail
+                }
+            ]
         };
     }
 
@@ -265,7 +296,7 @@ public sealed class DeviceVersionService
     }
 
     /// <summary>
-    /// 按标记行把单次 shell 的输出切成 SN、version、gen1-app、wlan0_bt_switch 四段，并取出各自的退出码。
+    /// 按标记行把单次 shell 的输出切成 SN、LAN MAC、version、gen1-app、wlan0_bt_switch 五段，并取出各自的退出码。
     /// 标记必须按脚本顺序出现，最后一个标记之后的文本归到最后一段。
     /// </summary>
     private static Dictionary<string, BoxSection> SplitBoxOutput(string standardOutput)

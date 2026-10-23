@@ -110,6 +110,45 @@
                                         </StackPanel>
                                     </Border>
 
+                                    <Border Background="#F5F6F7" Padding="10" Margin="0,16,0,0">
+                                        <StackPanel>
+                                            <TextBlock Text="设备动作" Foreground="{StaticResource MutedTextBrush}" />
+                                            <TextBlock Text="{Binding DeviceActionsHint}"
+                                                       Foreground="{StaticResource MutedTextBrush}"
+                                                       Margin="0,6,0,0" />
+                                            <ItemsControl ItemsSource="{Binding DeviceActions}">
+                                                <ItemsControl.ItemTemplate>
+                                                    <DataTemplate>
+                                                        <StackPanel Margin="0,8,0,0">
+                                                            <Grid>
+                                                                <Grid.ColumnDefinitions>
+                                                                    <ColumnDefinition Width="*" />
+                                                                    <ColumnDefinition Width="Auto" />
+                                                                </Grid.ColumnDefinitions>
+                                                                <TextBlock Text="{Binding Name}" FontWeight="SemiBold" />
+                                                                <TextBlock Grid.Column="1"
+                                                                           Text="{Binding Status}"
+                                                                           FontWeight="SemiBold"
+                                                                           Foreground="{Binding StatusBrush}" />
+                                                            </Grid>
+                                                            <TextBlock Text="{Binding Command}"
+                                                                       FontFamily="Consolas"
+                                                                       FontSize="11"
+                                                                       Foreground="{StaticResource MutedTextBrush}"
+                                                                       TextWrapping="Wrap"
+                                                                       Margin="0,2,0,0" />
+                                                            <TextBlock Text="{Binding Detail}"
+                                                                       FontSize="11"
+                                                                       Foreground="{Binding StatusBrush}"
+                                                                       TextWrapping="Wrap"
+                                                                       Margin="0,2,0,0" />
+                                                        </StackPanel>
+                                                    </DataTemplate>
+                                                </ItemsControl.ItemTemplate>
+                                            </ItemsControl>
+                                        </StackPanel>
+                                    </Border>
+
                                     <Grid Margin="0,18,0,0">
                                         <Border Background="#F5F6F7" Padding="10">
                                             <StackPanel>

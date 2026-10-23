@@ -165,7 +165,8 @@ dotnet test .\PackagingStationPC.slnx -c Debug --no-restore
   -> 清空上一台的界面状态（不删除数据库历史）
   -> 校验扫码内容
   -> 确认当前在线 ADB 设备
-  -> 读取盒子 SN 和版本
+  -> 读取盒子 SN，并写 LAN MAC 随机标记（界面"设备动作"卡片显示结果；写失败即判盒子失败）
+  -> 读取盒子版本
   -> 读取眼镜 SN 和版本
   -> 枚举 COM 口并读取左右手环 SN/版本
   -> 校验上报必需字段
@@ -199,6 +200,17 @@ sudo vendor_storage -r VENDOR_SN_ID -t string
 ```text
 [INFO] VENDOR_SN_ID:D1S724V30W2631000004
 ```
+
+读版本号之前先随机化 LAN MAC（写入后盒子重启时会重新生成一个 MAC 地址）：
+
+```sh
+sudo vendor_storage -w VENDOR_LAN_MAC_ID -i "00"
+```
+
+只做写入动作，MAC 本身不回读、不进采集结果（`Values`）、也不上报 MES，
+只在组件的 `Actions` 里留一条执行记录供界面展示。
+写失败**直接判盒子采集失败**：读到的 SN 和版本照旧保留在结果里（界面上看得到读到了什么），
+但盒子状态是失败，`IsComplete` 为假，预留 SN 与 MES 上报都被门禁拦住。
 
 随后执行：
 
@@ -238,12 +250,16 @@ cat /oem/config/wlan0_bt_switch
 0
 ```
 
-采集字段：`box.sn`、`box.uboot`、`box.kernel`、`box.rootfs`、`box.gen1App`、`box.wlan0BtSwitch`。
+采集字段：`box.sn`、`box.uboot`、`box.kernel`、`box.rootfs`、`box.gen1App`、`box.wlan0BtSwitch`（LAN MAC 不在其中）。
 ADB transport serial 只用于选择连接，不作为产品 SN。
 
-四条命令合并在同一条 shell 中执行（SN 需要 root 或 `sudo -n`，`dpkg-query` 只查包数据库不需要 root），
-用 `__BOX_SN_RC__`、`__BOX_VER_RC__`、`__BOX_APP_RC__`、`__BOX_SW_RC__` 四个标记行分段并带回各自退出码，
-避免多次 adb 往返。前三条中任一条失败都视为盒子采集失败（`Gen1-APP` 未安装时 `dpkg-query` 退出码非 0）。
+五条命令合并在同一条 shell 中执行（SN 与 LAN MAC 需要 root 或 `sudo -n`，`dpkg-query` 只查包数据库不需要 root），
+用 `__BOX_SN_RC__`、`__BOX_MAC_RC__`、`__BOX_VER_RC__`、`__BOX_APP_RC__`、`__BOX_SW_RC__` 五个标记行分段并带回各自退出码，
+避免多次 adb 往返。其中 SN、`version`、`dpkg-query` 任一条失败都视为盒子采集失败（`Gen1-APP` 未安装时 `dpkg-query` 退出码非 0）。
+
+采集期间执行的设备动作（写 LAN MAC）不算采集字段，但结果会影响判定：
+成功只是留一条记录；失败则整段盒子判失败，和读不到 SN 一样把流程拦住。
+界面右侧"设备动作"卡片按条展示动作名、结果与实际下发的命令。
 
 `cat` 这条是例外：开关文件在部分盒子上可能不存在或不可读，读不到时**不判采集失败**，
 只把 `wlan0BtSwitch` 留空，交给 5.4 的校验配置去判（默认 `allowMissing=false`，即读不到就算不合格）。
@@ -420,13 +436,14 @@ band.rightVersion
 | 眼镜 | `sn`、`uboot`、`kernel`、`rootfs`、`app` |
 | 手环 | `leftSn`、`rightSn` |
 
-此外还有两项不受 `requireCompleteVersionSet` 开关影响、失败时同样禁止预留 SN 与上报的校验：
+此外还有三项不受 `requireCompleteVersionSet` 开关影响、失败时同样禁止预留 SN 与上报的校验：
 
 - 手环左右配对（一左一右、SN 互不相同）；
-- 版本配置校验（见 5.4，盒子/眼镜/手环各一个开关，默认全开；版本与配置的不一致，或该字段读不到即阻断）。
+- 版本配置校验（见 5.4，盒子/眼镜/手环各一个开关，默认全开；版本与配置的不一致，或该字段读不到即阻断）；
+- 采集期间执行的设备动作没做成（当前是写 LAN MAC，见 5.1）：动作失败直接把该组件判 `Failed`。
 
-版本配置校验的阻断**直接判组件状态**（`State = Failed` 且 `Message` 带 `版本校验未通过：` 前缀），
-预留 SN 与上报各判一次，不依赖"必需字段为空"。`blockOnFail=false` 时组件只置 `Warning`，两处都放行。
+阻断统一按**组件状态**判定：`State = Failed` 即拦（读不到值、版本校验未通过、设备动作失败都适用），
+不依赖"必需字段为空"，因为值现在一律原样保留。`blockOnFail=false` 的校验项只置 `Warning`，两处都放行。
 
 任何必需字段为空时：
 
