@@ -128,6 +128,21 @@ public sealed class SwiftMomFactoryUploadServiceTests
     }
 
     [Fact]
+    public async Task Upload_FailsWhenTheRequestTimesOut()
+    {
+        // HttpClient 超时抛的是 TaskCanceledException（OperationCanceledException 的子类）：
+        // 以前那条 catch 的条件把它排除在外，异常一路抛到界面层，记录不会被更新，
+        // 于是上一次上传成功留下的 Succeeded 一直显示在界面上。超时必须按失败处理。
+        using var client = new HttpClient(new SlowHandler());
+        using var service = new SwiftMomFactoryUploadService(Configuration(1), client);
+
+        var result = await service.UploadAsync(Record());
+
+        Assert.False(result.Success);
+        Assert.Contains("超时", result.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task TestConnection_OnlyCallsClientLogin()
     {
         var handler = new RecordingHandler(
@@ -149,7 +164,7 @@ public sealed class SwiftMomFactoryUploadServiceTests
         return new AppLogger(path);
     }
 
-    private static FactorySystemConfiguration Configuration() => new()
+    private static FactorySystemConfiguration Configuration(int timeoutSeconds = 30) => new()
     {
         Mode = "swiftmom",
         BaseUrl = "http://192.168.10.17:8080/swiftmom/api",
@@ -160,7 +175,8 @@ public sealed class SwiftMomFactoryUploadServiceTests
         Password = "secret",
         ProdNo = "YC20260903001-YZ",
         StationNo = "T01",
-        Retest = "0"
+        Retest = "0",
+        TimeoutSeconds = timeoutSeconds
     };
 
     private static ProductionRecord Record() => new()
@@ -201,6 +217,18 @@ public sealed class SwiftMomFactoryUploadServiceTests
     {
         Content = new StringContent(body, Encoding.UTF8, "application/json")
     };
+
+    /// <summary>一直不返回，用来把请求拖到 HttpClient 超时。</summary>
+    private sealed class SlowHandler : HttpMessageHandler
+    {
+        protected override async Task<HttpResponseMessage> SendAsync(
+            HttpRequestMessage request,
+            CancellationToken cancellationToken)
+        {
+            await Task.Delay(TimeSpan.FromSeconds(3), cancellationToken);
+            throw new InvalidOperationException("请求应当在超时前被取消，不该走到这里。");
+        }
+    }
 
     private sealed class RecordingHandler(params HttpResponseMessage[] responses) : HttpMessageHandler
     {

@@ -358,6 +358,89 @@ public sealed class DeviceVersionServiceTests
         Assert.Equal(QueryState.Success, snapshot.Components.First(item => item.Component == "band").State);
     }
 
+    [Fact]
+    public async Task QueryDeviceTime_ReturnsTheBoxClock()
+    {
+        // 盒子 shell 会先吐终端噪声（ESC[c、"resize:Terminal is not VT100-compatible."），
+        // 取到的必须是它后面的时间正文，不能是这些噪声行。
+        var service = CreateTimeService(new ProcessResult(
+            0,
+            "\u001b[c\r\nresize:Terminal is not VT100-compatible.\r\nThu Oct 23 10:11:12 CST 2026\r\n",
+            string.Empty,
+            false));
+
+        var action = await service.QueryDeviceTimeAsync("adb-001");
+
+        Assert.True(action.Success);
+        Assert.Equal(DeviceVersionService.DeviceTimeActionKey, action.Key);
+        Assert.Equal("date", action.Command);
+        Assert.Equal("Thu Oct 23 10:11:12 CST 2026", action.Message);
+    }
+
+    [Fact]
+    public async Task QueryDeviceTime_ReportsFailureWithoutThrowing()
+    {
+        // 只做显示：命令失败也只是回一条失败记录，不能把正在跑的流水线带崩。
+        var service = CreateTimeService(new ProcessResult(1, string.Empty, "date: not found", false));
+
+        var action = await service.QueryDeviceTimeAsync("adb-001");
+
+        Assert.False(action.Success);
+        Assert.Contains("date: not found", action.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("Thu Oct 23 10:11:12 CST 2026", "2026-10-23 10:11:12")]
+    [InlineData("Thu Oct  3 09:05:00 GMT+08:00 2026", "2026-10-03 09:05:00")]
+    // 24 小时制：下午 1 点 07 分不能被写成 01:07。
+    [InlineData("Fri Oct 23 13:07:09 CST 2026", "2026-10-23 13:07:09")]
+    [InlineData("2026-10-23 19:52:31", "2026-10-23 19:52:31")]
+    // 认不出的一律原样返回，不做猜测，界面上看得出"这就是盒子给的原文"。
+    [InlineData("not a clock", "not a clock")]
+    [InlineData("", "")]
+    public void FormatDeviceTime_TurnsTheBoxClockIntoAReadableDate(string raw, string expected) =>
+        Assert.Equal(expected, DeviceVersionService.FormatDeviceTime(raw));
+
+    [Fact]
+    public async Task QueryDeviceTime_IgnoresShellNoiseWhenThereIsNoClockLine()
+    {
+        // 只有终端噪声、没有时间正文时不能把噪声当成时间显示出来。
+        var service = CreateTimeService(new ProcessResult(
+            0,
+            "\u001b[c\r\nresize:Terminal is not VT100-compatible.\r\n",
+            string.Empty,
+            false));
+
+        var action = await service.QueryDeviceTimeAsync("adb-001");
+
+        Assert.False(action.Success);
+        Assert.DoesNotContain("resize", action.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task QueryDeviceTime_ReportsFailureWhenNoDeviceIsOnline()
+    {
+        var runner = new RoutingProcessRunner()
+            .On("devices", () => new ProcessResult(0, "List of devices attached", string.Empty, false));
+        var adb = new AdbClient(new AdbConfiguration { Path = "adb" }, runner);
+        var service = new DeviceVersionService(adb, new StubBandService(), new GlassesAcmService(adb));
+
+        var action = await service.QueryDeviceTimeAsync("adb-001");
+
+        Assert.False(action.Success);
+        Assert.Contains("ADB", action.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>造一个只关心 <c>date</c> 这条命令的服务。</summary>
+    private static DeviceVersionService CreateTimeService(ProcessResult dateResult)
+    {
+        var runner = new RoutingProcessRunner()
+            .On("devices", () => new ProcessResult(0, "List of devices attached\nadb-001 device", string.Empty, false))
+            .On("date", () => dateResult);
+        var adb = new AdbClient(new AdbConfiguration { Path = "adb" }, runner);
+        return new DeviceVersionService(adb, new StubBandService(), new GlassesAcmService(adb));
+    }
+
     /// <summary>在原盒子输出后面拼上 wlan0_bt_switch 那一段（脚本里它是最后一条命令）。</summary>
     private static string BoxOutputWithSwitch(string switchOutput, int exitCode = 0) =>
         $"{BoxOutput}\n{switchOutput}\n__BOX_SW_RC__={exitCode}";

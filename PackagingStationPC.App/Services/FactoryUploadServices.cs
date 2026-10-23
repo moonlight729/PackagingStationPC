@@ -233,6 +233,30 @@ public sealed class SwiftMomFactoryUploadService : IFactoryUploadService, IDispo
             await LogAsync("ERROR", $"SwiftMOM upload exception pcbSeq={record.PackageSn}: {ex}");
             return new IntegrationResult(false, $"SwiftMOM 上传失败: {ex.Message}");
         }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            // HttpClient 超时抛的是 TaskCanceledException，它是 OperationCanceledException 的子类，
+            // 上面那条 catch 的条件把它排除在外，异常会一路抛到界面层：记录不会被更新，
+            // 于是上一次上传成功留下的 Succeeded 就一直显示在界面和数据库里。超时必须按失败处理。
+            var timeoutSeconds = (int)_httpClient.Timeout.TotalSeconds;
+            Report(activeStage, "Failed", $"请求超时（{timeoutSeconds} 秒无响应）");
+            if (activeStage == "clientLogin")
+            {
+                Report("checkRoute", "Skipped", "登录超时，未执行");
+                Report("createRoute", "Skipped", "登录超时，未执行");
+            }
+            else if (activeStage == "checkRoute")
+            {
+                Report("createRoute", "Skipped", "过站检查超时，未执行");
+            }
+
+            await LogAsync(
+                "ERROR",
+                $"SwiftMOM upload timeout pcbSeq={record.PackageSn}, stage={activeStage}, timeoutSeconds={timeoutSeconds}");
+            return new IntegrationResult(
+                false,
+                $"SwiftMOM 上传超时: {activeStage} 等待响应超过 {timeoutSeconds} 秒，请检查 MES 地址与网络后重试。");
+        }
     }
 
     private void ReportResponse(string stage, SwiftMomResponse response) => Report(

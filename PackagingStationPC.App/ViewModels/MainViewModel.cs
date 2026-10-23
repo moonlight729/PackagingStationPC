@@ -27,6 +27,7 @@ public sealed class MainViewModel : ObservableObject
     private string _scannerInput = string.Empty;
     private string _scannedPackageCode = string.Empty;
     private string _deviceActionsHint = "本轮尚未执行设备动作";
+    private string _deviceTimeText = string.Empty;
     private string _loginStageStatus = "等待上传";
     private string _checkRouteStageStatus = "等待上传";
     private string _createRouteStageStatus = "等待上传";
@@ -119,6 +120,16 @@ public sealed class MainViewModel : ObservableObject
     {
         get => _deviceActionsHint;
         private set => SetProperty(ref _deviceActionsHint, value);
+    }
+
+    /// <summary>
+    /// 盒子系统时间（`date` 的输出），显示在"上传状态"卡片下方，只有时间本身、不带任何文字；
+    /// 读不到时为空。只做显示，不参与门禁、不写库、不上报。
+    /// </summary>
+    public string DeviceTimeText
+    {
+        get => _deviceTimeText;
+        private set => SetProperty(ref _deviceTimeText, value);
     }
 
     public AdbDeviceInfo? SelectedDevice
@@ -305,30 +316,38 @@ public sealed class MainViewModel : ObservableObject
         ModuleHasError = false;
         await _logger.WriteAsync("INFO", $"Scan received package={packageCode}, selectedDevice={SelectedDevice?.Serial ?? "auto"}");
         ModuleMessage = $"已扫描 {packageCode}，正在读取设备 SN 和版本。";
-        await QueryVersionsAsync();
-        if (_snapshot is null)
+        try
         {
-            throw new InvalidOperationException("设备信息读取没有返回结果。");
-        }
+            await QueryVersionsAsync();
+            if (_snapshot is null)
+            {
+                throw new InvalidOperationException("设备信息读取没有返回结果。");
+            }
 
-        var validationError = ValidateForUpload(_snapshot);
-        if (validationError is not null)
+            var validationError = ValidateForUpload(_snapshot);
+            if (validationError is not null)
+            {
+                throw new InvalidOperationException($"设备信息不完整，禁止上传 MES：{validationError}");
+            }
+
+            var reservation = await _repository.BindScannedPackageAsync(
+                packageCode,
+                _snapshot,
+                _configuration.Sn.ProductCode,
+                _configuration.Sn.ProductName,
+                _configuration.StationCode);
+            CurrentRecord = reservation.Record;
+            await _logger.WriteAsync(
+                "INFO",
+                $"Package binding saved package={packageCode}, device={_snapshot.DeviceSerial}, adb={_snapshot.AdbSerial}, existing={reservation.WasExisting}");
+            await RefreshRecordsAsync();
+            await UploadAsync();
+        }
+        finally
         {
-            throw new InvalidOperationException($"设备信息不完整，禁止上传 MES：{validationError}");
+            // 整轮跑完都读一次盒子时间：被门禁拦下、上传失败都一样读到，只显示，不卡流程。
+            await ShowDeviceTimeAsync();
         }
-
-        var reservation = await _repository.BindScannedPackageAsync(
-            packageCode,
-            _snapshot,
-            _configuration.Sn.ProductCode,
-            _configuration.Sn.ProductName,
-            _configuration.StationCode);
-        CurrentRecord = reservation.Record;
-        await _logger.WriteAsync(
-            "INFO",
-            $"Package binding saved package={packageCode}, device={_snapshot.DeviceSerial}, adb={_snapshot.AdbSerial}, existing={reservation.WasExisting}");
-        await RefreshRecordsAsync();
-        await UploadAsync();
     }
 
     private void ResetCurrentUnit()
@@ -339,6 +358,7 @@ public sealed class MainViewModel : ObservableObject
         VersionRows.Clear();
         DeviceActions.Clear();
         DeviceActionsHint = "本轮尚未执行设备动作";
+        DeviceTimeText = string.Empty;
         ModuleMessage = string.Empty;
         ModuleHasError = false;
         LoginStageStatus = "等待上传";
@@ -474,18 +494,10 @@ public sealed class MainViewModel : ObservableObject
                 component.State is QueryState.Success ? "INFO" : "ERROR",
                 $"Version component={component.Component}, state={component.State}, values={values}, source={component.Source}, message={component.Message}");
 
-            // 设备动作（写 LAN MAC 这类）：不是采集字段，不进上报，只在界面上和日志里留痕。
+            // 设备动作（写 LAN MAC、取设备日志时间这类）：不是采集字段，不进上报，只在界面上和日志里留痕。
             foreach (var action in component.Actions)
             {
-                DeviceActions.Add(new DeviceActionRowViewModel(
-                    action.DisplayName,
-                    action.Success ? "成功" : "失败",
-                    action.Success ? "#087F75" : "#B42318",
-                    action.Command,
-                    action.Message));
-                await _logger.WriteAsync(
-                    action.Success ? "INFO" : "ERROR",
-                    $"Device action component={component.Component}, key={action.Key}, command={action.Command}, success={action.Success}, message={action.Message}");
+                await AddDeviceActionAsync(component.Component, action);
             }
         }
 
@@ -495,6 +507,69 @@ public sealed class MainViewModel : ObservableObject
             "INFO",
             $"Version query device={_snapshot.AdbSerial}, complete={_snapshot.IsComplete}, app={BuildVersion.Display}");
         RaiseCommandStates();
+    }
+
+    /// <summary>
+    /// 往"设备动作"卡片加一条记录并写日志。动作不是采集字段：只显示，不参与门禁，也不上报。
+    /// </summary>
+    private async Task AddDeviceActionAsync(string component, DeviceActionResult action)
+    {
+        // 同一轮里同一个动作可能被执行多次（例如扫码流程结束后又手动上传一次），
+        // 按标识原地替换，卡片上只留最新一次的结果，不重复堆行。
+        var row = new DeviceActionRowViewModel(
+            action.Key,
+            action.DisplayName,
+            action.Success ? "成功" : "失败",
+            action.Success ? "#087F75" : "#B42318",
+            action.Command,
+            action.Message);
+        var existing = DeviceActions.FirstOrDefault(item =>
+            string.Equals(item.Key, action.Key, StringComparison.Ordinal));
+        if (existing is null)
+        {
+            DeviceActions.Add(row);
+        }
+        else
+        {
+            DeviceActions[DeviceActions.IndexOf(existing)] = row;
+        }
+
+        DeviceActionsHint = string.Empty;
+        await _logger.WriteAsync(
+            action.Success ? "INFO" : "ERROR",
+            $"Device action component={component}, key={action.Key}, command={action.Command}, success={action.Success}, message={action.Message}");
+    }
+
+    /// <summary>
+    /// 上传流程跑完之后取一次盒子系统时间：纯显示，改的是"设备动作"卡片，
+    /// 不动上传结果（ModuleMessage / ModuleHasError），失败也绝不卡流水线。
+    /// </summary>
+    private async Task ShowDeviceTimeAsync()
+    {
+        DeviceActionResult action;
+        try
+        {
+            action = await _versionService.QueryDeviceTimeAsync(SelectedDevice?.Serial);
+        }
+        catch (Exception ex)
+        {
+            // 兜底：这条只做显示，任何异常都不能影响上传结果。
+            action = new DeviceActionResult
+            {
+                Key = DeviceVersionService.DeviceTimeActionKey,
+                DisplayName = "设备日志时间",
+                Command = DeviceVersionService.DeviceTimeCommand,
+                Success = false,
+                Message = ex.Message
+            };
+        }
+
+        await AddDeviceActionAsync("box", action);
+        // 界面上只显示时间本身，不配任何文字：读不到就留空，细节（失败原因）进日志。
+        // 盒子给的是 "Thu Oct 23 10:11:12 CST 2026" 这类输出，整理成 24 小时制的年月日时分秒。
+        DeviceTimeText = action.Success
+            ? DeviceVersionService.FormatDeviceTime(action.Message)
+            : string.Empty;
     }
 
     /// <summary>
@@ -594,13 +669,31 @@ public sealed class MainViewModel : ObservableObject
     private async Task UploadAsync()
     {
         var record = CurrentRecord ?? throw new InvalidOperationException("请先预留 SN。");
-        var result = await _uploadService.UploadAsync(record);
-        await _repository.UpdateUploadAsync(record.Id, result);
-        CurrentRecord = await _repository.GetByIdAsync(record.Id);
-        ModuleMessage = result.Message;
-        ModuleHasError = !result.Success;
-        await RefreshRecordsAsync();
-        await _logger.WriteAsync(result.Success ? "INFO" : "ERROR", $"Upload sn={record.PackageSn}: {result.Message}");
+        try
+        {
+            var result = await _uploadService.UploadAsync(record);
+            await _repository.UpdateUploadAsync(record.Id, result);
+            CurrentRecord = await _repository.GetByIdAsync(record.Id);
+            ModuleMessage = result.Message;
+            ModuleHasError = !result.Success;
+            await RefreshRecordsAsync();
+            await _logger.WriteAsync(result.Success ? "INFO" : "ERROR", $"Upload sn={record.PackageSn}: {result.Message}");
+        }
+        catch (Exception ex)
+        {
+            // 上传过程抛异常（例如真被取消）也要把这条记录写成失败：
+            // 否则数据库和界面上会一直留着上一次上传成功留下的 Succeeded，看着像"上传成功了"。
+            await _repository.UpdateUploadAsync(record.Id, new IntegrationResult(false, ex.Message));
+            CurrentRecord = await _repository.GetByIdAsync(record.Id);
+            await RefreshRecordsAsync();
+            await _logger.WriteAsync("ERROR", $"Upload threw sn={record.PackageSn}: {ex.Message}");
+            throw;
+        }
+        finally
+        {
+            // 不管 MES 上传成功、失败还是直接抛异常，最后都读一次盒子时间：只显示，不改上传结果、不卡流程。
+            await ShowDeviceTimeAsync();
+        }
     }
 
     private async Task NextDeviceAsync()

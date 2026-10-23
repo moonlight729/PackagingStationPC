@@ -32,6 +32,76 @@ public sealed class DeviceVersionService
     /// <summary>"写 LAN MAC"这个动作在 <see cref="VersionComponentResult.Actions"/> 里的标识。</summary>
     public const string LanMacActionKey = "lanMac";
 
+    /// <summary>"取设备日志时间"这个动作在界面动作列表里的标识。</summary>
+    public const string DeviceTimeActionKey = "deviceTime";
+
+    /// <summary>盒子上的时间命令：输出盒子当前系统时间。</summary>
+    public const string DeviceTimeCommand = "date";
+
+    /// <summary>像时间的一行：带 HH:MM 或四位年份，用来从 shell 噪声里挑出时间正文。</summary>
+    private static readonly Regex DeviceTimeLinePattern =
+        new(@"\d{1,2}:\d{2}|\b(?:19|20)\d{2}\b", RegexOptions.CultureInvariant);
+
+    /// <summary>
+    /// 时间里的星期 token（Thu 之类），任何位置都剔掉：盒子的系统时间不准时"星期几"和后面的日期对不上，
+    /// .NET 会因为这个不一致直接判解析失败。
+    /// </summary>
+    private static readonly Regex DeviceTimeWeekdayPattern = new(
+        @"^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)[,.]?$",
+        RegexOptions.CultureInvariant | RegexOptions.IgnoreCase);
+
+    /// <summary>
+    /// 时区 token（CST、GMT+08:00、+0800 之类），各家实现不同。只在时间之后出现才剔，
+    /// 免得把月份（Oct 也是三个大写字母）一起删掉。
+    /// </summary>
+    private static readonly Regex DeviceTimeZonePattern = new(
+        @"^(?:[A-Z]{2,5}|(?:GMT|UTC)?[+-]\d{2}:?\d{2})$",
+        RegexOptions.CultureInvariant);
+
+    /// <summary>盒子时间正文可能有的几种形状，逐条试；都不匹配就原样返回。</summary>
+    private static readonly string[] DeviceTimeFormats =
+    [
+        "MMM d HH:mm:ss yyyy",
+        "MMM d HH:mm yyyy",
+        "yyyy-MM-dd HH:mm:ss",
+        "yyyy-MM-dd HH:mm",
+        "yyyy/MM/dd HH:mm:ss",
+        "yyyy/MM/dd HH:mm",
+        "yyyy-MM-ddTHH:mm:ss",
+        "yyyy-MM-dd",
+        "yyyy.MM.dd HH:mm:ss",
+        "d MMM HH:mm:ss yyyy"
+    ];
+
+    /// <summary>
+    /// 把盒子返回的原始时间整理成人可读的 <c>yyyy-MM-dd HH:mm:ss</c>（24 小时制）。
+    /// 认不出来就原样返回，不做任何猜测，界面上看得出来"这就是盒子给的原文"。
+    /// </summary>
+    internal static string FormatDeviceTime(string raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw))
+        {
+            return string.Empty;
+        }
+
+        var tokens = raw.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Where(token => !DeviceTimeWeekdayPattern.IsMatch(token))
+            .ToArray();
+        var timeIndex = Array.FindIndex(tokens, token => token.Contains(':', StringComparison.Ordinal));
+        var text = string.Join(
+            ' ',
+            tokens.Where((token, index) =>
+                timeIndex < 0 || index <= timeIndex || !DeviceTimeZonePattern.IsMatch(token)));
+        return DateTime.TryParseExact(
+                   text,
+                   DeviceTimeFormats,
+                   CultureInfo.InvariantCulture,
+                   DateTimeStyles.None,
+                   out var value)
+            ? value.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture)
+            : text;
+    }
+
     private readonly AdbClient _adbClient;
     private readonly IBandSerialVersionService _bandSerialVersionService;
     private readonly GlassesAcmService _glassesAcmService;
@@ -106,6 +176,55 @@ public sealed class DeviceVersionService
             CollectedAt = DateTimeOffset.Now,
             Components = components
         };
+    }
+
+    /// <summary>
+    /// 取盒子当前系统时间（<c>date</c>）。这是上传流程跑完之后单独做的动作，只用于界面显示：
+    /// 不属于采集字段（不进 Values、不参与门禁），设备不在线或命令失败也只回一条失败记录，
+    /// 一律不抛异常，免得把正在跑的流水线带偏。
+    /// </summary>
+    public async Task<DeviceActionResult> QueryDeviceTimeAsync(
+        string? selectedSerial,
+        CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            var device = await _adbClient.ResolveDeviceAsync(selectedSerial, cancellationToken);
+            var result = await _adbClient.ShellAsync(device.Serial, DeviceTimeCommand, cancellationToken);
+            // 盒子 shell 启动时会先吐一串终端噪声：ANSI 转义应答（ESC[c）、
+            // "resize:Terminal is not VT100-compatible." 之类。时间正文夹在这些行后面，
+            // 所以不能取首行，要先剥转义再挑"像时间"的那一行；挑不到就当没读到，不把噪声显示出来。
+            var text = StripAnsi(result.StandardOutput)
+                .Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                .FirstOrDefault(line => DeviceTimeLinePattern.IsMatch(line)) ?? string.Empty;
+            var ok = result.Success && text.Length > 0;
+            var message = ok || text.Length > 0
+                ? text
+                : !string.IsNullOrWhiteSpace(result.StandardError)
+                    ? result.StandardError.Trim()
+                    : result.TimedOut ? "执行超时" : "无输出";
+            ProgressChanged?.Invoke($"设备日志时间: {message}");
+            return new DeviceActionResult
+            {
+                Key = DeviceTimeActionKey,
+                DisplayName = "设备日志时间",
+                Command = DeviceTimeCommand,
+                Success = ok,
+                Message = message
+            };
+        }
+        catch (Exception ex)
+        {
+            // 只做显示：任何异常都吞掉，转成一条失败记录。
+            return new DeviceActionResult
+            {
+                Key = DeviceTimeActionKey,
+                DisplayName = "设备日志时间",
+                Command = DeviceTimeCommand,
+                Success = false,
+                Message = ex.Message
+            };
+        }
     }
 
     /// <summary>
@@ -330,11 +449,20 @@ public sealed class DeviceVersionService
 
     /// <summary>取开关文件输出的首行；命令失败或没有内容时返回空串，由校验配置决定怎么判。</summary>
     private static string ReadFirstLine(BoxSection section) =>
-        section.ExitCode == 0
-            ? section.Output.Split(
-                ['\r', '\n'],
-                StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).FirstOrDefault() ?? string.Empty
-            : string.Empty;
+        section.ExitCode == 0 ? FirstNonEmptyLine(section.Output) : string.Empty;
+
+    /// <summary>一段输出里的第一行非空内容；没有就返回空串。</summary>
+    private static string FirstNonEmptyLine(string text) =>
+        text.Split(
+            ['\r', '\n'],
+            StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).FirstOrDefault() ?? string.Empty;
+
+    /// <summary>
+    /// 剥掉 ANSI 转义序列：盒子的 adb shell 会话会先吐一串终端查询应答（<c>ESC[c</c> 之类），
+    /// 直接取首行会取到这串控制字符，界面上显示出来就是乱码，必须先把正文前的转义清掉。
+    /// </summary>
+    private static string StripAnsi(string text) =>
+        Regex.Replace(text, @"\x1B(?:\[[0-9;?]*[A-Za-z]|[@-Z\\-_])", string.Empty);
 
     private static bool TryReadExitCode(string line, string marker, out int exitCode)
     {
