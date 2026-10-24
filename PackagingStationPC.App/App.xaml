@@ -10,6 +10,8 @@
         <SolidColorBrush x:Key="AccentBrush" Color="#087F75" />
         <SolidColorBrush x:Key="AccentHoverBrush" Color="#066A62" />
         <SolidColorBrush x:Key="AmberBrush" Color="#B66A00" />
+        <!-- 盒子时间的读数色：比主题色更沉的蓝，跟按钮/链接色区分开，长时间盯着不刺眼。 -->
+        <SolidColorBrush x:Key="TimeTextBrush" Color="#0E4C7C" />
 
         <Style TargetType="Window">
             <Setter Property="FontFamily" Value="Microsoft YaHei UI" />

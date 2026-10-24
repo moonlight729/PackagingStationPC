@@ -136,22 +136,17 @@
                                         </Border>
                                     </Grid>
 
-                                    <!-- 盒子系统时间：跟在"上传状态"卡片下面，标签列宽和卡片里的三阶段一致，读不到时留空。 -->
-                                    <Grid Margin="0,10,0,0">
-                                        <Grid.ColumnDefinitions>
-                                            <ColumnDefinition Width="105" />
-                                            <ColumnDefinition Width="*" />
-                                        </Grid.ColumnDefinitions>
-                                        <TextBlock Text="当前时间"
-                                                   Foreground="{StaticResource MutedTextBrush}"
-                                                   VerticalAlignment="Center" />
-                                        <TextBlock Grid.Column="1"
-                                                   Text="{Binding DeviceTimeText}"
-                                                   FontSize="19"
+                                    <!-- 盒子系统时间：占住"上传状态"卡片下面的空白，上一行小字标题、下面才是时间本身；读不到时留空。 -->
+                                    <StackPanel Margin="0,16,0,0">
+                                        <TextBlock Text="设备当前时间："
+                                                   FontSize="12"
+                                                   Foreground="{StaticResource MutedTextBrush}" />
+                                        <TextBlock Text="{Binding DeviceTimeText}"
+                                                   FontSize="44"
                                                    FontWeight="Bold"
-                                                   Foreground="{StaticResource AccentBrush}"
-                                                   VerticalAlignment="Center" />
-                                    </Grid>
+                                                   Foreground="{StaticResource TimeTextBrush}"
+                                                   Margin="0,2,0,0" />
+                                    </StackPanel>
                                 </StackPanel>
                             </ScrollViewer>
                         </Border>
