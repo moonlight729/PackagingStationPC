@@ -58,6 +58,15 @@ public sealed class DeviceVersionService
         @"^(?:[A-Z]{2,5}|(?:GMT|UTC)?[+-]\d{2}:?\d{2})$",
         RegexOptions.CultureInvariant);
 
+    /// <summary>
+    /// 12 小时制的上下午标记（AM/PM）。盒子的 <c>date</c> 是 12 小时制，
+    /// 必须在剔时区噪声之前先摘出来：它同样是两个大写字母，会被当成时区一起删掉，
+    /// 下午 5 点就会被显示成 05:00。
+    /// </summary>
+    private static readonly Regex DeviceTimeMeridiemPattern = new(
+        @"^(?:AM|PM)\.?$",
+        RegexOptions.CultureInvariant | RegexOptions.IgnoreCase);
+
     /// <summary>盒子时间正文可能有的几种形状，逐条试；都不匹配就原样返回。</summary>
     private static readonly string[] DeviceTimeFormats =
     [
@@ -87,19 +96,33 @@ public sealed class DeviceVersionService
         var tokens = raw.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
             .Where(token => !DeviceTimeWeekdayPattern.IsMatch(token))
             .ToArray();
+        var meridiem = Array.Find(tokens, token => DeviceTimeMeridiemPattern.IsMatch(token));
         var timeIndex = Array.FindIndex(tokens, token => token.Contains(':', StringComparison.Ordinal));
         var text = string.Join(
             ' ',
             tokens.Where((token, index) =>
-                timeIndex < 0 || index <= timeIndex || !DeviceTimeZonePattern.IsMatch(token)));
+                !DeviceTimeMeridiemPattern.IsMatch(token)
+                && (timeIndex < 0 || index <= timeIndex || !DeviceTimeZonePattern.IsMatch(token))));
         return DateTime.TryParseExact(
                    text,
                    DeviceTimeFormats,
                    CultureInfo.InvariantCulture,
                    DateTimeStyles.None,
                    out var value)
-            ? value.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture)
+            ? To24Hour(value, meridiem).ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture)
             : text;
+    }
+
+    /// <summary>按 AM/PM 把 12 小时制的读数换成 24 小时制；没有标记就原样返回。</summary>
+    private static DateTime To24Hour(DateTime value, string? meridiem)
+    {
+        var isAfternoon = string.Equals(meridiem?.Trim('.'), "PM", StringComparison.OrdinalIgnoreCase);
+        var isForenoon = string.Equals(meridiem?.Trim('.'), "AM", StringComparison.OrdinalIgnoreCase);
+        return isAfternoon && value.Hour < 12
+            ? value.AddHours(12)
+            : isForenoon && value.Hour == 12
+                ? value.AddHours(-12)
+                : value;
     }
 
     private readonly AdbClient _adbClient;

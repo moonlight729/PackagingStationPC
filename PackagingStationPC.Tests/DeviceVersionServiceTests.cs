@@ -398,6 +398,21 @@ public sealed class DeviceVersionServiceTests
     // 认不出的一律原样返回，不做猜测，界面上看得出"这就是盒子给的原文"。
     [InlineData("not a clock", "not a clock")]
     [InlineData("", "")]
+    // 盒子的 date 是 12 小时制带 AM/PM，下面这组上下午全都要换成 24 小时制。
+    [InlineData("Mon Oct 26 09:45:25 AM CST 2026", "2026-10-26 09:45:25")]
+    [InlineData("Mon Oct 26 11:59:59 AM CST 2026", "2026-10-26 11:59:59")]
+    [InlineData("Mon Oct 26 12:00:00 PM CST 2026", "2026-10-26 12:00:00")]
+    [InlineData("Mon Oct 26 12:30:00 PM CST 2026", "2026-10-26 12:30:00")]
+    [InlineData("Mon Oct 26 01:00:00 PM CST 2026", "2026-10-26 13:00:00")]
+    // 下午 5 点必须显示成 17 点，不能被当成 05 点。
+    [InlineData("Mon Oct 26 05:00:00 PM CST 2026", "2026-10-26 17:00:00")]
+    [InlineData("Mon Oct 26 11:59:59 PM CST 2026", "2026-10-26 23:59:59")]
+    // 半夜 12 点：AM 的 12 点是 00 点。
+    [InlineData("Mon Oct 26 12:00:00 AM CST 2026", "2026-10-26 00:00:00")]
+    [InlineData("Mon Oct 26 12:30:00 AM CST 2026", "2026-10-26 00:30:00")]
+    // 小写 am/pm 同样要认。
+    [InlineData("Mon Oct 26 05:00:00 pm CST 2026", "2026-10-26 17:00:00")]
+    [InlineData("Mon Oct 26 05:00:00 pm +0800 2026", "2026-10-26 17:00:00")]
     public void FormatDeviceTime_TurnsTheBoxClockIntoAReadableDate(string raw, string expected) =>
         Assert.Equal(expected, DeviceVersionService.FormatDeviceTime(raw));
 
